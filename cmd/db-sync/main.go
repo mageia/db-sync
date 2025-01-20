@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/spf13/pflag"
 )
 
 type CLILogger struct{}
@@ -88,28 +90,37 @@ func detectDBType(dsn string) string {
 
 func main() {
 	var (
-		operation   = flag.String("op", "", "操作类型: sync/load")
-		dbType      = flag.String("type", "", "数据库类型: postgres/mysql (可选，通常可以从DSN自动识别)")
-		dsn         = flag.String("dsn", "", "数据库连接字符串")
-		file        = flag.String("file", "", "备份文件路径")
-		batchSize   = flag.Int("batch-size", 1000, "批处理大小")
-		tables      = flag.String("tables", "", "要处理的表（逗号分隔）")
-		clearBefore = flag.Bool("clear", false, "恢复前是否清空表")
+		operation   string
+		dbType      string
+		dsn         string
+		file        string
+		batchSize   int
+		tables      string
+		clearBefore bool
 	)
 
-	flag.Parse()
+	// 定义参数，自动支持长短形式
+	pflag.StringVarP(&operation, "op", "o", "", "操作类型: sync/load")
+	pflag.StringVarP(&dbType, "type", "t", "", "数据库类型: postgres/mysql (可选，通常可以从DSN自动识别)")
+	pflag.StringVarP(&dsn, "dsn", "d", "", "数据库连接字符串")
+	pflag.StringVarP(&file, "file", "f", "", "备份文件路径")
+	pflag.IntVarP(&batchSize, "batch-size", "b", 1000, "批处理大小")
+	pflag.StringVarP(&tables, "tables", "T", "", "要处理的表（逗号分隔）")
+	pflag.BoolVarP(&clearBefore, "clear", "C", false, "恢复前是否清空表")
+
+	pflag.Parse()
 
 	// 检查必需参数并提供友好的错误提示
 	var missingFlags []string
-	if *operation == "" {
-		missingFlags = append(missingFlags, "-op")
-	} else if *operation != "sync" && *operation != "load" {
-		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync 或 load\n", *operation)
+	if operation == "" {
+		missingFlags = append(missingFlags, "--op")
+	} else if operation != "sync" && operation != "load" {
+		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync 或 load\n", operation)
 		os.Exit(1)
 	}
 
-	if *dsn == "" {
-		missingFlags = append(missingFlags, "-dsn")
+	if dsn == "" {
+		missingFlags = append(missingFlags, "--dsn")
 	}
 
 	if len(missingFlags) > 0 {
@@ -118,32 +129,32 @@ func main() {
 			fmt.Printf("  %s\n", flag)
 		}
 		fmt.Println("\n使用示例:")
-		fmt.Printf("  备份数据库:   %s -op sync -dsn \"postgresql://user:pass@host:port/dbname\"\n", os.Args[0])
-		fmt.Printf("  恢复数据库:   %s -op load -dsn \"postgresql://user:pass@host:port/dbname\" -file backup.sql\n", os.Args[0])
+		fmt.Printf("  备份数据库:   %s --op sync --dsn \"postgresql://user:pass@host:port/dbname\"\n", os.Args[0])
+		fmt.Printf("  恢复数据库:   %s --op load --dsn \"postgresql://user:pass@host:port/dbname\" --file backup.sql\n", os.Args[0])
 		fmt.Println("\n可用的参数:")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	// 自动检测数据库类型
-	detectedType := detectDBType(*dsn)
-	if detectedType == "" && *dbType == "" {
-		fmt.Println("错误: 无法从DSN自动识别数据库类型，请使用 -type 参数指定数据库类型 (postgres/mysql)")
+	detectedType := detectDBType(dsn)
+	if detectedType == "" && dbType == "" {
+		fmt.Println("错误: 无法从DSN自动识别数据库类型，请使用 --type 参数指定数据库类型 (postgres/mysql)")
 		os.Exit(1)
 	}
 
 	// 如果未指定类型，使用检测到的类型；如果指定了类型，验证其有效性
 	finalDBType := detectedType
-	if *dbType != "" {
-		if *dbType != "postgres" && *dbType != "mysql" {
-			fmt.Printf("错误: 不支持的数据库类型 '%s'，必须是 postgres 或 mysql\n", *dbType)
+	if dbType != "" {
+		if dbType != "postgres" && dbType != "mysql" {
+			fmt.Printf("错误: 不支持的数据库类型 '%s'，必须是 postgres 或 mysql\n", dbType)
 			os.Exit(1)
 		}
 		// 如果检测到的类型与指定的类型不一致，发出警告
-		if detectedType != "" && detectedType != *dbType {
-			fmt.Printf("警告: DSN格式显示数据库类型为 %s，但用户指定为 %s\n", detectedType, *dbType)
+		if detectedType != "" && detectedType != dbType {
+			fmt.Printf("警告: DSN格式显示数据库类型为 %s，但用户指定为 %s\n", detectedType, dbType)
 		}
-		finalDBType = *dbType
+		finalDBType = dbType
 	}
 
 	var db backup.DatabaseBackup
@@ -164,23 +175,23 @@ func main() {
 
 	// 解析表名
 	var tableList []string
-	if *tables != "" {
-		tableList = strings.Split(*tables, ",")
+	if tables != "" {
+		tableList = strings.Split(tables, ",")
 	}
 
-	switch *operation {
+	switch operation {
 	case "sync":
-		if *file == "" {
+		if file == "" {
 			// 从 DSN 中提取数据库名称
-			dbName := extractDBNameFromDSN(*dsn)
+			dbName := extractDBNameFromDSN(dsn)
 			// 生成备份文件名：dbname_type_timestamp.sql
 			timestamp := time.Now().Format("20060102_150405")
-			*file = fmt.Sprintf("%s_%s_%s.sql", dbName, finalDBType, timestamp)
-			logger.Info("使用自动生成的备份文件路径", "path", *file)
+			file = fmt.Sprintf("%s_%s_%s.sql", dbName, finalDBType, timestamp)
+			logger.Info("使用自动生成的备份文件路径", "path", file)
 		}
 
-		err := db.Sync(ctx, *dsn, *file, backup.BackupOptions{
-			BatchSize: *batchSize,
+		err := db.Sync(ctx, dsn, file, backup.BackupOptions{
+			BatchSize: batchSize,
 			Tables:    tableList,
 			Logger:    logger,
 		})
@@ -190,15 +201,15 @@ func main() {
 		}
 
 	case "load":
-		if *file == "" {
+		if file == "" {
 			fmt.Println("需要指定备份文件路径")
 			os.Exit(1)
 		}
 
-		err := db.Load(ctx, *file, *dsn, backup.LoadOptions{
-			BatchSize:       *batchSize,
+		err := db.Load(ctx, file, dsn, backup.LoadOptions{
+			BatchSize:       batchSize,
 			Tables:          tableList,
-			ClearBeforeLoad: *clearBefore,
+			ClearBeforeLoad: clearBefore,
 			Logger:          logger,
 		})
 		if err != nil {
@@ -207,7 +218,7 @@ func main() {
 		}
 
 	default:
-		fmt.Printf("不支持的操作类型: %s\n", *operation)
+		fmt.Printf("不支持的操作类型: %s\n", operation)
 		os.Exit(1)
 	}
 
