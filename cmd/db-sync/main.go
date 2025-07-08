@@ -11,6 +11,11 @@ import (
 	"os"
 	"strings"
 	"time"
+	"net/url"
+	"regexp"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/spf13/pflag"
 )
@@ -63,6 +68,35 @@ func (l *CLILogger) Debug(msg string, fields ...interface{}) {
 	}
 }
 
+// 脱敏 DSN 中的密码信息
+func sanitizeDSN(dsn string) string {
+	// PostgreSQL URL 格式
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		if u, err := url.Parse(dsn); err == nil {
+			if u.User != nil {
+				username := u.User.Username()
+				u.User = url.User(username) // 只保留用户名，移除密码
+			}
+			return u.String()
+		}
+	}
+
+	// MySQL URL 格式
+	if strings.HasPrefix(dsn, "mysql://") {
+		if u, err := url.Parse(dsn); err == nil {
+			if u.User != nil {
+				username := u.User.Username()
+				u.User = url.User(username)
+			}
+			return u.String()
+		}
+	}
+
+	// 其他格式（如 user:pass@tcp(host)/db）使用正则替换
+	re := regexp.MustCompile(`(:)([^:@]+)(@)`)
+	return re.ReplaceAllString(dsn, "${1}***${3}")
+}
+
 // 添加新的函数：从 DSN 推测数据库类型
 func detectDBType(dsn string) string {
 	// PostgreSQL URL 格式检测
@@ -89,6 +123,23 @@ func detectDBType(dsn string) string {
 }
 
 func main() {
+	// 设置信号处理和优雅停机
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 监听信号
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-sigChan
+		fmt.Println("\n收到停机信号，正在优雅停机...")
+		cancel()
+	}()
+
 	var (
 		operation   string
 		dbType      string
@@ -97,6 +148,7 @@ func main() {
 		batchSize   int
 		tables      string
 		clearBefore bool
+		validate    bool
 	)
 
 	// 定义参数，自动支持长短形式
@@ -107,6 +159,7 @@ func main() {
 	pflag.IntVarP(&batchSize, "batch-size", "b", 1000, "批处理大小")
 	pflag.StringVarP(&tables, "tables", "T", "", "要处理的表（逗号分隔）")
 	pflag.BoolVarP(&clearBefore, "clear", "C", false, "恢复前是否清空表")
+	pflag.BoolVarP(&validate, "validate", "V", false, "备份后是否验证完整性")
 
 	pflag.Parse()
 
@@ -129,8 +182,8 @@ func main() {
 			fmt.Printf("  %s\n", flag)
 		}
 		fmt.Println("\n使用示例:")
-		fmt.Printf("  备份数据库:   %s --op sync --dsn \"postgresql://user:pass@host:port/dbname\"\n", os.Args[0])
-		fmt.Printf("  恢复数据库:   %s --op load --dsn \"postgresql://user:pass@host:port/dbname\" --file backup.sql\n", os.Args[0])
+		fmt.Printf("  备份数据库:   %s --op sync --dsn \"postgresql://user:***@host:port/dbname\"\n", os.Args[0])
+		fmt.Printf("  恢复数据库:   %s --op load --dsn \"postgresql://user:***@host:port/dbname\" --file backup.sql\n", os.Args[0])
 		fmt.Println("\n可用的参数:")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -171,7 +224,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	// 使用带取消机制的上下文
 
 	// 解析表名
 	var tableList []string
@@ -190,14 +243,52 @@ func main() {
 			logger.Info("使用自动生成的备份文件路径", "path", file)
 		}
 
+		// 设置进度显示回调
+		progressCallback := func(tableName string, processed, total int64) {
+			if total > 0 {
+				percent := float64(processed) / float64(total) * 100
+				fmt.Printf("\r备份表 %s: %d/%d (%.1f%%)   ", tableName, processed, total, percent)
+			} else {
+				fmt.Printf("\r备份表 %s: %d 条记录   ", tableName, processed)
+			}
+		}
+
 		err := db.Sync(ctx, dsn, file, backup.BackupOptions{
-			BatchSize: batchSize,
-			Tables:    tableList,
-			Logger:    logger,
+			BatchSize:        batchSize,
+			Tables:           tableList,
+			Logger:           logger,
+			ProgressCallback: progressCallback,
 		})
+		fmt.Println() // 换行
 		if err != nil {
-			fmt.Printf("备份失败: %v\n", err)
+			fmt.Printf("备份失败: %v [DSN: %s]\n", err, sanitizeDSN(dsn))
 			os.Exit(1)
+		}
+
+		// 如果启用验证，执行备份完整性检查
+		if validate {
+			fmt.Println("正在验证备份完整性...")
+			results, err := db.ValidateBackup(ctx, dsn, file, tableList)
+			if err != nil {
+				fmt.Printf("验证失败: %v\n", err)
+				os.Exit(1)
+			}
+
+			allValid := true
+			for _, result := range results {
+				if result.IsValid {
+					fmt.Printf("✓ 表 %s: 验证通过 (%d 条记录)\n", result.TableName, result.SourceCount)
+				} else {
+					fmt.Printf("✗ 表 %s: 验证失败 - %s\n", result.TableName, result.ErrorMessage)
+					allValid = false
+				}
+			}
+
+			if !allValid {
+				fmt.Println("备份验证失败，存在数据不一致问题")
+				os.Exit(1)
+			}
+			fmt.Println("所有表验证通过，备份完整性正常")
 		}
 
 	case "load":
@@ -206,14 +297,26 @@ func main() {
 			os.Exit(1)
 		}
 
+		// 设置进度显示回调
+		progressCallback := func(tableName string, processed, total int64) {
+			if total > 0 {
+				percent := float64(processed) / float64(total) * 100
+				fmt.Printf("\r恢复表 %s: %d/%d (%.1f%%)   ", tableName, processed, total, percent)
+			} else {
+				fmt.Printf("\r恢复表 %s: %d 条记录   ", tableName, processed)
+			}
+		}
+
 		err := db.Load(ctx, file, dsn, backup.LoadOptions{
-			BatchSize:       batchSize,
-			Tables:          tableList,
-			ClearBeforeLoad: clearBefore,
-			Logger:          logger,
+			BatchSize:        batchSize,
+			Tables:           tableList,
+			ClearBeforeLoad:  clearBefore,
+			Logger:           logger,
+			ProgressCallback: progressCallback,
 		})
+		fmt.Println() // 换行
 		if err != nil {
-			fmt.Printf("恢复失败: %v\n", err)
+			fmt.Printf("恢复失败: %v [DSN: %s]\n", err, sanitizeDSN(dsn))
 			os.Exit(1)
 		}
 
@@ -222,7 +325,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("操作完成")
+	// 等待所有 goroutine 完成
+	wg.Wait()
+
+	// 检查是否因为取消而退出
+	select {
+	case <-ctx.Done():
+		fmt.Println("操作被取消")
+		os.Exit(130) // SIGINT 退出码
+	default:
+		fmt.Println("操作完成")
+	}
 }
 
 // 添加辅助函数：从 DSN 中提取数据库名称

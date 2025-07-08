@@ -1,11 +1,13 @@
 package mysql
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"db-sync/pkg/backup"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,7 +26,7 @@ func NewMySQLBackup(logger backup.Logger) *MySQLBackup {
 }
 
 func (m *MySQLBackup) Sync(ctx context.Context, dsn string, outputPath string, opts backup.BackupOptions) error {
-	db, err := sql.Open("mysql", dsn)
+	db, err := m.openDBWithRetry(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
 	}
@@ -46,8 +48,8 @@ func (m *MySQLBackup) Sync(ctx context.Context, dsn string, outputPath string, o
 		}
 	}
 
-	// 创建输出文件
-	file, err := os.Create(outputPath)
+	// 创建输出文件并设置安全权限 (0600 - 仅所有者可读写)
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("创建备份文件失败: %w", err)
 	}
@@ -62,7 +64,7 @@ func (m *MySQLBackup) Sync(ctx context.Context, dsn string, outputPath string, o
 	for _, table := range tables {
 		m.logger.Info("开始备份表", "table", table)
 
-		if err := m.backupTable(ctx, tx, table, file, opts.BatchSize); err != nil {
+		if err := m.backupTable(ctx, tx, table, file, opts.BatchSize, opts.ProgressCallback); err != nil {
 			return fmt.Errorf("备份表 %s 失败: %w", table, err)
 		}
 	}
@@ -75,7 +77,7 @@ func (m *MySQLBackup) Sync(ctx context.Context, dsn string, outputPath string, o
 	return tx.Commit()
 }
 
-func (m *MySQLBackup) backupTable(ctx context.Context, tx *sql.Tx, table string, file *os.File, batchSize int) error {
+func (m *MySQLBackup) backupTable(ctx context.Context, tx *sql.Tx, table string, file *os.File, batchSize int, progressCallback backup.ProgressCallback) error {
 	// 获取表结构
 	schema, err := m.getTableSchema(ctx, tx, table)
 	if err != nil {
@@ -93,16 +95,41 @@ func (m *MySQLBackup) backupTable(ctx context.Context, tx *sql.Tx, table string,
 		return fmt.Errorf("获取表列信息失败: %w", err)
 	}
 
-	// 分批查询数据
+	// 获取表总记录数用于进度显示
+	var totalRows int64
+	if progressCallback != nil {
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
+		if err := tx.QueryRowContext(ctx, countQuery).Scan(&totalRows); err != nil {
+			m.logger.Debug("获取表记录数失败", "table", table, "error", err)
+			totalRows = 0
+		}
+	}
+
+	// 分批查询数据 - 使用参数化查询
 	offset := 0
+	var processedRows int64
 	for {
-		query := fmt.Sprintf("SELECT * FROM `%s` LIMIT %d OFFSET %d", table, batchSize, offset)
-		rows, err := tx.QueryContext(ctx, query)
+		query := fmt.Sprintf("SELECT * FROM `%s` LIMIT ? OFFSET ?", table)
+		rows, err := tx.QueryContext(ctx, query, batchSize, offset)
 		if err != nil {
 			return err
 		}
 
+		// 创建缓冲写入器以提高性能
+		bufWriter := bufio.NewWriterSize(file, 64*1024) // 64KB 缓冲
+		defer bufWriter.Flush()
+
+		// 构建 INSERT 语句前缀 - 使用安全的标识符
+		quotedColumns := make([]string, len(columns))
+		for i, col := range columns {
+			quotedColumns[i] = fmt.Sprintf("`%s`", col)
+		}
+		insertPrefix := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES ", table, strings.Join(quotedColumns, ", "))
+
 		count := 0
+		batchCount := 0
+		var batchValues []string
+
 		for rows.Next() {
 			// 准备接收数据的切片
 			values := make([]interface{}, len(columns))
@@ -117,8 +144,7 @@ func (m *MySQLBackup) backupTable(ctx context.Context, tx *sql.Tx, table string,
 				return fmt.Errorf("扫描数据失败: %w", err)
 			}
 
-			// 构建 INSERT 语句
-			insertSQL := fmt.Sprintf("INSERT INTO `%s` (`%s`) VALUES (", table, strings.Join(columns, "`, `"))
+			// 构建值列表
 			vals := make([]string, len(columns))
 			for i, val := range values {
 				if val == nil {
@@ -142,15 +168,38 @@ func (m *MySQLBackup) backupTable(ctx context.Context, tx *sql.Tx, table string,
 					}
 				}
 			}
-			insertSQL += strings.Join(vals, ", ") + ");\n"
-
-			// 写入 INSERT 语句
-			if _, err := file.WriteString(insertSQL); err != nil {
-				rows.Close()
-				return fmt.Errorf("写入数据失败: %w", err)
-			}
-
+			batchValues = append(batchValues, fmt.Sprintf("(%s)", strings.Join(vals, ", ")))
+			batchCount++
 			count++
+
+			// 每100条记录或缓冲区快满时写入一次
+			if batchCount >= 100 || bufWriter.Available() < 1024 {
+				if err := m.writeBatch(bufWriter, insertPrefix, batchValues); err != nil {
+					rows.Close()
+					return err
+				}
+				batchValues = batchValues[:0] // 清空切片但保留容量
+				batchCount = 0
+				
+				// 更新进度
+				processedRows = int64(offset + count)
+				if progressCallback != nil {
+					progressCallback(table, processedRows, totalRows)
+				}
+			}
+		}
+
+		// 写入剩余的数据
+		if batchCount > 0 {
+			if err := m.writeBatch(bufWriter, insertPrefix, batchValues); err != nil {
+				return err
+			}
+		}
+
+		// 最终进度更新
+		processedRows = int64(offset + count)
+		if progressCallback != nil {
+			progressCallback(table, processedRows, totalRows)
 		}
 		rows.Close()
 
@@ -216,7 +265,7 @@ func (m *MySQLBackup) getTableColumns(ctx context.Context, tx *sql.Tx, table str
 }
 
 func (m *MySQLBackup) Load(ctx context.Context, backupFile string, dsn string, opts backup.LoadOptions) error {
-	db, err := sql.Open("mysql", dsn)
+	db, err := m.openDBWithRetry(ctx, dsn)
 	if err != nil {
 		return fmt.Errorf("连接数据库失败: %w", err)
 	}
@@ -317,6 +366,169 @@ func extractTableName(stmt string) string {
 			tableName := strings.Trim(parts[2], "`")
 			return strings.Trim(tableName, `"`)
 		}
+	}
+	return ""
+}
+
+// writeBatch 批量写入 INSERT 语句
+func (m *MySQLBackup) writeBatch(writer *bufio.Writer, insertPrefix string, values []string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	
+	sql := insertPrefix + strings.Join(values, ", ") + ";\n"
+	if _, err := writer.WriteString(sql); err != nil {
+		return fmt.Errorf("写入数据失败: %w", err)
+	}
+	
+	return nil
+}
+
+// openDBWithRetry 打开数据库连接，带重试和超时机制
+func (m *MySQLBackup) openDBWithRetry(ctx context.Context, dsn string) (*sql.DB, error) {
+	const maxRetries = 3
+	const retryDelay = 2 * time.Second
+	const connectionTimeout = 30 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		if i > 0 {
+			m.logger.Info("重试连接数据库", "attempt", i+1, "max_retries", maxRetries)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+			}
+		}
+
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			m.logger.Error("打开数据库连接失败", "error", err, "attempt", i+1)
+			if i == maxRetries-1 {
+				return nil, err
+			}
+			continue
+		}
+
+		// 设置连接参数
+		db.SetMaxOpenConns(10)
+		db.SetMaxIdleConns(5)
+		db.SetConnMaxLifetime(5 * time.Minute)
+
+		// 创建带超时的上下文
+		pingCtx, cancel := context.WithTimeout(ctx, connectionTimeout)
+		defer cancel()
+
+		// 测试连接
+		if err := db.PingContext(pingCtx); err != nil {
+			m.logger.Error("数据库连接测试失败", "error", err, "attempt", i+1)
+			db.Close()
+			if i == maxRetries-1 {
+				return nil, fmt.Errorf("数据库连接测试失败: %w", err)
+			}
+			continue
+		}
+
+		m.logger.Info("数据库连接成功", "attempt", i+1)
+		return db, nil
+	}
+
+	return nil, fmt.Errorf("达到最大重试次数 %d", maxRetries)
+}
+
+// ValidateBackup 验证备份完整性
+func (m *MySQLBackup) ValidateBackup(ctx context.Context, dsn string, backupFile string, tables []string) ([]backup.ValidationResult, error) {
+	db, err := m.openDBWithRetry(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("连接数据库失败: %w", err)
+	}
+	defer db.Close()
+
+	var results []backup.ValidationResult
+
+	// 获取备份文件中的表统计信息
+	backupCounts, err := m.getBackupTableCounts(backupFile)
+	if err != nil {
+		return nil, fmt.Errorf("分析备份文件失败: %w", err)
+	}
+
+	// 如果没有指定表，使用备份文件中的所有表
+	if len(tables) == 0 {
+		for table := range backupCounts {
+			tables = append(tables, table)
+		}
+	}
+
+	// 验证每个表
+	for _, table := range tables {
+		result := backup.ValidationResult{
+			TableName: table,
+			IsValid:   false,
+		}
+
+		// 获取源数据库中的记录数
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
+		if err := db.QueryRowContext(ctx, countQuery).Scan(&result.SourceCount); err != nil {
+			result.ErrorMessage = fmt.Sprintf("获取源表记录数失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		// 获取备份文件中的记录数
+		if count, exists := backupCounts[table]; exists {
+			result.BackupCount = count
+		} else {
+			result.ErrorMessage = "备份文件中未找到该表"
+			results = append(results, result)
+			continue
+		}
+
+		// 比较记录数
+		if result.SourceCount == result.BackupCount {
+			result.IsValid = true
+		} else {
+			result.ErrorMessage = fmt.Sprintf("记录数不匹配: 源=%d, 备份=%d", result.SourceCount, result.BackupCount)
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+// getBackupTableCounts 分析备份文件，统计每个表的记录数
+func (m *MySQLBackup) getBackupTableCounts(backupFile string) (map[string]int64, error) {
+	file, err := os.Open(backupFile)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	counts := make(map[string]int64)
+	scanner := bufio.NewScanner(file)
+	
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "INSERT INTO") {
+			// 从 INSERT 语句中提取表名
+			if tableName := m.extractTableNameFromInsert(line); tableName != "" {
+				counts[tableName]++
+			}
+		}
+	}
+
+	return counts, scanner.Err()
+}
+
+// extractTableNameFromInsert 从 INSERT 语句中提取表名
+func (m *MySQLBackup) extractTableNameFromInsert(insertSQL string) string {
+	// INSERT INTO `table_name` 或 INSERT INTO table_name
+	re := regexp.MustCompile(`INSERT\s+INTO\s+(?:\x60([^\x60]+)\x60|([^\s(]+))`)
+	matches := re.FindStringSubmatch(insertSQL)
+	if len(matches) > 2 {
+		if matches[1] != "" {
+			return matches[1] // 带反引号的表名
+		}
+		return matches[2] // 不带反引号的表名
 	}
 	return ""
 }
