@@ -532,3 +532,500 @@ func (m *MySQLBackup) extractTableNameFromInsert(insertSQL string) string {
 	}
 	return ""
 }
+
+// SyncDatabase 数据库间同步
+func (m *MySQLBackup) SyncDatabase(ctx context.Context, sourceDSN, targetDSN string, opts backup.SyncOptions) ([]backup.SyncResult, error) {
+	// 连接源数据库
+	sourceDB, err := m.openDBWithRetry(ctx, sourceDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接源数据库失败: %w", err)
+	}
+	defer sourceDB.Close()
+
+	// 连接目标数据库
+	targetDB, err := m.openDBWithRetry(ctx, targetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接目标数据库失败: %w", err)
+	}
+	defer targetDB.Close()
+
+	// 获取要同步的表列表
+	tables := opts.Tables
+	if len(tables) == 0 {
+		tables, err = m.getAllTablesFromDB(ctx, sourceDB)
+		if err != nil {
+			return nil, fmt.Errorf("获取源数据库表列表失败: %w", err)
+		}
+	}
+
+	var results []backup.SyncResult
+
+	// 逐表同步
+	for _, table := range tables {
+		opts.Logger.Info("开始同步表", "table", table, "mode", opts.Mode)
+		
+		result, err := m.syncTable(ctx, sourceDB, targetDB, table, opts)
+		if err != nil {
+			opts.Logger.Error("同步表失败", "table", table, "error", err)
+			result.ErrorMessage = err.Error()
+		}
+		
+		results = append(results, result)
+		
+		// 如果遇到错误且策略为 fail，立即停止
+		if err != nil && opts.ConflictStrategy == backup.ConflictStrategyFail {
+			return results, fmt.Errorf("同步表 %s 失败: %w", table, err)
+		}
+	}
+
+	return results, nil
+}
+
+// syncTable 同步单个表
+func (m *MySQLBackup) syncTable(ctx context.Context, sourceDB, targetDB *sql.DB, table string, opts backup.SyncOptions) (backup.SyncResult, error) {
+	startTime := time.Now()
+	result := backup.SyncResult{
+		TableName: table,
+	}
+
+	// 获取表结构信息
+	columns, primaryKeys, err := m.getTableInfo(ctx, sourceDB, table)
+	if err != nil {
+		return result, fmt.Errorf("获取表信息失败: %w", err)
+	}
+
+	// 根据同步模式执行不同的同步策略
+	switch opts.Mode {
+	case backup.SyncModeFull:
+		err = m.syncTableFull(ctx, sourceDB, targetDB, table, columns, primaryKeys, opts, &result)
+	case backup.SyncModeIncremental:
+		err = m.syncTableIncremental(ctx, sourceDB, targetDB, table, columns, primaryKeys, opts, &result)
+	default:
+		return result, fmt.Errorf("不支持的同步模式: %s", opts.Mode)
+	}
+
+	result.Duration = time.Since(startTime)
+	return result, err
+}
+
+// getAllTablesFromDB 从数据库连接获取所有表名
+func (m *MySQLBackup) getAllTablesFromDB(ctx context.Context, db *sql.DB) ([]string, error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	return m.getAllTables(ctx, tx)
+}
+
+// getTableInfo 获取表的列信息和主键信息  
+func (m *MySQLBackup) getTableInfo(ctx context.Context, db *sql.DB, table string) (columns, primaryKeys []string, err error) {
+	// 获取列信息
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	columns, err = m.getTableColumns(ctx, tx, table)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 获取主键信息
+	pkQuery := `
+		SELECT COLUMN_NAME 
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE 
+		WHERE TABLE_SCHEMA = DATABASE() 
+		AND TABLE_NAME = ? 
+		AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION
+	`
+	
+	rows, err := tx.QueryContext(ctx, pkQuery, table)
+	if err != nil {
+		return columns, nil, fmt.Errorf("获取主键信息失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var pkColumn string
+		if err := rows.Scan(&pkColumn); err != nil {
+			return columns, nil, err
+		}
+		primaryKeys = append(primaryKeys, fmt.Sprintf("`%s`", pkColumn))
+	}
+
+	// 如果没有主键，使用所有列排序（不推荐，但作为备选）
+	if len(primaryKeys) == 0 {
+		for _, col := range columns {
+			primaryKeys = append(primaryKeys, fmt.Sprintf("`%s`", col))
+		}
+	}
+
+	return columns, primaryKeys, nil
+}
+
+// tableExists 检查表是否存在
+func (m *MySQLBackup) tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_schema = DATABASE() 
+			AND table_name = ?
+		)
+	`
+	
+	var exists bool
+	err := db.QueryRowContext(ctx, query, table).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("检查表是否存在失败: %w", err)
+	}
+	
+	return exists, nil
+}
+
+// getTableSchemaFromDB 从数据库连接获取表结构（用于同步时的表创建）
+func (m *MySQLBackup) getTableSchemaFromDB(ctx context.Context, db *sql.DB, table string) (string, error) {
+	query := fmt.Sprintf("SHOW CREATE TABLE `%s`", table)
+	var tableName, createSQL string
+	err := db.QueryRowContext(ctx, query).Scan(&tableName, &createSQL)
+	if err != nil {
+		return "", fmt.Errorf("获取表结构失败: %w", err)
+	}
+
+	return createSQL, nil
+}
+
+// syncTableFull MySQL 全量同步表
+func (m *MySQLBackup) syncTableFull(ctx context.Context, sourceDB, targetDB *sql.DB, table string, columns, primaryKeys []string, opts backup.SyncOptions, result *backup.SyncResult) error {
+	// 获取源表总记录数
+	var totalRows int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
+	if err := sourceDB.QueryRowContext(ctx, countQuery).Scan(&totalRows); err != nil {
+		return fmt.Errorf("获取源表记录数失败: %w", err)
+	}
+
+	if !opts.DryRun {
+		// 检查目标表是否存在，如果不存在则创建
+		exists, err := m.tableExists(ctx, targetDB, table)
+		if err != nil {
+			return fmt.Errorf("检查目标表是否存在失败: %w", err)
+		}
+		
+		if !exists {
+			// 获取源表结构
+			createSQL, err := m.getTableSchemaFromDB(ctx, sourceDB, table)
+			if err != nil {
+				return fmt.Errorf("获取源表结构失败: %w", err)
+			}
+			
+			// 在目标数据库创建表
+			if _, err := targetDB.ExecContext(ctx, createSQL); err != nil {
+				return fmt.Errorf("创建目标表失败: %w", err)
+			}
+			
+			opts.Logger.Info("已创建目标表", "table", table)
+		} else {
+			// 清空目标表（全量同步）
+			truncateQuery := fmt.Sprintf("TRUNCATE TABLE `%s`", table)
+			if _, err := targetDB.ExecContext(ctx, truncateQuery); err != nil {
+				return fmt.Errorf("清空目标表失败: %w", err)
+			}
+		}
+	}
+
+	// 分批读取源数据并插入目标数据库
+	offset := 0
+	for {
+		// 查询源数据
+		selectQuery := fmt.Sprintf("SELECT * FROM `%s` ORDER BY %s LIMIT ? OFFSET ?", 
+			table, strings.Join(primaryKeys, ", "))
+		
+		rows, err := sourceDB.QueryContext(ctx, selectQuery, opts.BatchSize, offset)
+		if err != nil {
+			return fmt.Errorf("查询源数据失败: %w", err)
+		}
+
+		count := 0
+		var insertData [][]interface{}
+
+		for rows.Next() {
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return fmt.Errorf("扫描源数据失败: %w", err)
+			}
+
+			insertData = append(insertData, values)
+			count++
+		}
+		rows.Close()
+
+		// 批量插入目标数据库
+		if len(insertData) > 0 && !opts.DryRun {
+			if err := m.batchInsert(ctx, targetDB, table, columns, insertData); err != nil {
+				return fmt.Errorf("批量插入失败: %w", err)
+			}
+		}
+
+		result.ProcessedRows += int64(count)
+		result.InsertedRows += int64(count)
+
+		// 更新进度
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(table, result.ProcessedRows, totalRows)
+		}
+
+		if count < opts.BatchSize {
+			break
+		}
+		offset += opts.BatchSize
+	}
+
+	return nil
+}
+
+// batchInsert MySQL 批量插入数据
+func (m *MySQLBackup) batchInsert(ctx context.Context, db *sql.DB, table string, columns []string, data [][]interface{}) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	// 构建插入语句
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		quotedColumns[i] = fmt.Sprintf("`%s`", col)
+	}
+
+	// 构建值占位符
+	valuePlaceholders := make([]string, len(data))
+	args := make([]interface{}, 0, len(data)*len(columns))
+	
+	for i, row := range data {
+		placeholders := make([]string, len(columns))
+		for j := range columns {
+			placeholders[j] = "?"
+			args = append(args, row[j])
+		}
+		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
+	}
+
+	insertQuery := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+		table,
+		strings.Join(quotedColumns, ", "),
+		strings.Join(valuePlaceholders, ", "))
+
+	_, err := db.ExecContext(ctx, insertQuery, args...)
+	return err
+}
+
+// syncTableIncremental MySQL 增量同步表（简化实现，MySQL不支持UPSERT，使用REPLACE或INSERT ON DUPLICATE KEY UPDATE）
+func (m *MySQLBackup) syncTableIncremental(ctx context.Context, sourceDB, targetDB *sql.DB, table string, columns, primaryKeys []string, opts backup.SyncOptions, result *backup.SyncResult) error {
+	if opts.TimestampColumn == "" {
+		return fmt.Errorf("增量同步必须指定时间戳列名")
+	}
+
+	// 构建时间戳条件
+	var timeCondition string
+	var timeArgs []interface{}
+	if opts.LastSyncTime != nil {
+		timeCondition = fmt.Sprintf("WHERE `%s` > ?", opts.TimestampColumn)
+		timeArgs = append(timeArgs, *opts.LastSyncTime)
+	} else {
+		// 如果没有指定最后同步时间，默认同步最近24小时的数据
+		timeCondition = fmt.Sprintf("WHERE `%s` > DATE_SUB(NOW(), INTERVAL 24 HOUR)", opts.TimestampColumn)
+	}
+
+	// 获取需要同步的记录数
+	var totalRows int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s` %s", table, timeCondition)
+	if err := sourceDB.QueryRowContext(ctx, countQuery, timeArgs...).Scan(&totalRows); err != nil {
+		return fmt.Errorf("获取增量记录数失败: %w", err)
+	}
+
+	if totalRows == 0 {
+		opts.Logger.Info("表无增量数据", "table", table)
+		return nil
+	}
+
+	// 分批处理增量数据
+	offset := 0
+	var maxTimestamp *time.Time
+
+	for {
+		// 查询增量数据，按时间戳排序
+		selectQuery := fmt.Sprintf("SELECT * FROM `%s` %s ORDER BY `%s` LIMIT ? OFFSET ?",
+			table, timeCondition, opts.TimestampColumn)
+		
+		queryArgs := append(timeArgs, opts.BatchSize, offset)
+		rows, err := sourceDB.QueryContext(ctx, selectQuery, queryArgs...)
+		if err != nil {
+			return fmt.Errorf("查询增量数据失败: %w", err)
+		}
+
+		count := 0
+		var upsertData [][]interface{}
+
+		for rows.Next() {
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return fmt.Errorf("扫描增量数据失败: %w", err)
+			}
+
+			// 记录最大时间戳
+			for i, col := range columns {
+				if col == opts.TimestampColumn {
+					if ts, ok := values[i].(time.Time); ok {
+						if maxTimestamp == nil || ts.After(*maxTimestamp) {
+							maxTimestamp = &ts
+						}
+					}
+				}
+			}
+
+			upsertData = append(upsertData, values)
+			count++
+		}
+		rows.Close()
+
+		// 执行 UPSERT 操作（MySQL 使用 INSERT ... ON DUPLICATE KEY UPDATE）
+		if len(upsertData) > 0 && !opts.DryRun {
+			insertedRows, updatedRows, err := m.batchUpsert(ctx, targetDB, table, columns, primaryKeys, upsertData, opts.ConflictStrategy)
+			if err != nil {
+				return fmt.Errorf("批量 UPSERT 失败: %w", err)
+			}
+			result.InsertedRows += insertedRows
+			result.UpdatedRows += updatedRows
+		}
+
+		result.ProcessedRows += int64(count)
+
+		// 更新进度
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(table, result.ProcessedRows, totalRows)
+		}
+
+		if count < opts.BatchSize {
+			break
+		}
+		offset += opts.BatchSize
+	}
+
+	// 记录最后同步时间
+	result.LastSyncTime = maxTimestamp
+
+	return nil
+}
+
+// batchUpsert MySQL 批量 UPSERT 操作
+func (m *MySQLBackup) batchUpsert(ctx context.Context, db *sql.DB, table string, columns, primaryKeys []string, data [][]interface{}, strategy backup.ConflictStrategy) (insertedRows, updatedRows int64, err error) {
+	if len(data) == 0 {
+		return 0, 0, nil
+	}
+
+	// 构建 UPSERT 语句
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		quotedColumns[i] = fmt.Sprintf("`%s`", col)
+	}
+
+	// 构建值占位符
+	valuePlaceholders := make([]string, len(data))
+	args := make([]interface{}, 0, len(data)*len(columns))
+	
+	for i, row := range data {
+		placeholders := make([]string, len(columns))
+		for j := range columns {
+			placeholders[j] = "?"
+			args = append(args, row[j])
+		}
+		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
+	}
+
+	var upsertQuery string
+	switch strategy {
+	case backup.ConflictStrategySkip:
+		// 使用 INSERT IGNORE 跳过冲突记录
+		upsertQuery = fmt.Sprintf("INSERT IGNORE INTO `%s` (%s) VALUES %s",
+			table,
+			strings.Join(quotedColumns, ", "),
+			strings.Join(valuePlaceholders, ", "))
+			
+	case backup.ConflictStrategyOverwrite:
+		// 使用 REPLACE INTO 或 INSERT ... ON DUPLICATE KEY UPDATE
+		updateSets := make([]string, 0, len(columns))
+		pkMap := make(map[string]bool)
+		for _, pk := range primaryKeys {
+			pkMap[strings.Trim(pk, "`")] = true
+		}
+		
+		for _, col := range quotedColumns {
+			colName := strings.Trim(col, "`")
+			if !pkMap[colName] {
+				updateSets = append(updateSets, fmt.Sprintf("%s = VALUES(%s)", col, col))
+			}
+		}
+		
+		if len(updateSets) > 0 {
+			upsertQuery = fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s ON DUPLICATE KEY UPDATE %s",
+				table,
+				strings.Join(quotedColumns, ", "),
+				strings.Join(valuePlaceholders, ", "),
+				strings.Join(updateSets, ", "))
+		} else {
+			// 如果只有主键，使用 REPLACE
+			upsertQuery = fmt.Sprintf("REPLACE INTO `%s` (%s) VALUES %s",
+				table,
+				strings.Join(quotedColumns, ", "),
+				strings.Join(valuePlaceholders, ", "))
+		}
+			
+	case backup.ConflictStrategyFail:
+		// 普通插入，遇到冲突就失败
+		upsertQuery = fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+			table,
+			strings.Join(quotedColumns, ", "),
+			strings.Join(valuePlaceholders, ", "))
+	}
+
+	result, err := db.ExecContext(ctx, upsertQuery, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	
+	// MySQL 的统计比较复杂，这里简化处理
+	switch strategy {
+	case backup.ConflictStrategySkip, backup.ConflictStrategyFail:
+		return rowsAffected, 0, nil
+	case backup.ConflictStrategyOverwrite:
+		// 对于 INSERT ... ON DUPLICATE KEY UPDATE，MySQL 返回：
+		// - 1 表示插入了新行
+		// - 2 表示更新了现有行
+		// 但由于是批量操作，这里估算
+		totalExpected := int64(len(data))
+		if rowsAffected <= totalExpected {
+			return rowsAffected, 0, nil
+		}
+		// 如果 affected rows > expected，说明有更新操作
+		updated := rowsAffected - totalExpected
+		inserted := totalExpected - updated
+		return inserted, updated, nil
+	}
+
+	return rowsAffected, 0, nil
+}

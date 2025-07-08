@@ -307,6 +307,60 @@ func (p *PostgresBackup) getTableColumns(ctx context.Context, tx *sql.Tx, table 
 	return columns, nil
 }
 
+// tableExists 检查表是否存在
+func (p *PostgresBackup) tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	query := `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables 
+			WHERE table_schema = 'public' 
+			AND table_name = $1
+		)
+	`
+	
+	var exists bool
+	err := db.QueryRowContext(ctx, query, table).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("检查表是否存在失败: %w", err)
+	}
+	
+	return exists, nil
+}
+
+// getTableSchemaFromDB 从数据库连接获取表结构（用于同步时的表创建）
+func (p *PostgresBackup) getTableSchemaFromDB(ctx context.Context, db *sql.DB, table string) (string, error) {
+	query := `
+		SELECT 
+			'CREATE TABLE ' || quote_ident(table_name) || ' (' ||
+			string_agg(
+				quote_ident(column_name) || ' ' ||
+				data_type ||
+				CASE 
+					WHEN character_maximum_length IS NOT NULL 
+					THEN '(' || character_maximum_length || ')'
+					ELSE ''
+				END ||
+				CASE 
+					WHEN is_nullable = 'NO' 
+					THEN ' NOT NULL'
+					ELSE ''
+				END,
+				', '
+			) || ');'
+		FROM information_schema.columns
+		WHERE table_schema = 'public'
+		AND table_name = $1
+		GROUP BY table_name;
+	`
+
+	var createSQL string
+	err := db.QueryRowContext(ctx, query, table).Scan(&createSQL)
+	if err != nil {
+		return "", fmt.Errorf("获取表结构失败: %w", err)
+	}
+
+	return createSQL, nil
+}
+
 // Load 从备份文件恢复到数据库
 func (p *PostgresBackup) Load(ctx context.Context, backupFile string, dsn string, opts backup.LoadOptions) error {
 	dsn = ensureSSLMode(dsn)
@@ -682,6 +736,484 @@ func extractTableNameFromInsert(insertSQL string) string {
 		return matches[2] // 不带引号的表名
 	}
 	return ""
+}
+
+// SyncDatabase 数据库间同步
+func (p *PostgresBackup) SyncDatabase(ctx context.Context, sourceDSN, targetDSN string, opts backup.SyncOptions) ([]backup.SyncResult, error) {
+	sourceDSN = ensureSSLMode(sourceDSN)
+	targetDSN = ensureSSLMode(targetDSN)
+
+	// 连接源数据库
+	sourceDB, err := p.openDBWithRetry(ctx, sourceDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接源数据库失败: %w", err)
+	}
+	defer sourceDB.Close()
+
+	// 连接目标数据库
+	targetDB, err := p.openDBWithRetry(ctx, targetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接目标数据库失败: %w", err)
+	}
+	defer targetDB.Close()
+
+	// 获取要同步的表列表
+	tables := opts.Tables
+	if len(tables) == 0 {
+		tables, err = p.getAllTablesFromDB(ctx, sourceDB)
+		if err != nil {
+			return nil, fmt.Errorf("获取源数据库表列表失败: %w", err)
+		}
+	}
+
+	var results []backup.SyncResult
+
+	// 逐表同步
+	for _, table := range tables {
+		opts.Logger.Info("开始同步表", "table", table, "mode", opts.Mode)
+		
+		result, err := p.syncTable(ctx, sourceDB, targetDB, table, opts)
+		if err != nil {
+			opts.Logger.Error("同步表失败", "table", table, "error", err)
+			result.ErrorMessage = err.Error()
+		}
+		
+		results = append(results, result)
+		
+		// 如果遇到错误且策略为 fail，立即停止
+		if err != nil && opts.ConflictStrategy == backup.ConflictStrategyFail {
+			return results, fmt.Errorf("同步表 %s 失败: %w", table, err)
+		}
+	}
+
+	return results, nil
+}
+
+// syncTable 同步单个表
+func (p *PostgresBackup) syncTable(ctx context.Context, sourceDB, targetDB *sql.DB, table string, opts backup.SyncOptions) (backup.SyncResult, error) {
+	startTime := time.Now()
+	result := backup.SyncResult{
+		TableName: table,
+	}
+
+	// 获取表结构信息
+	columns, primaryKeys, err := p.getTableInfo(ctx, sourceDB, table)
+	if err != nil {
+		return result, fmt.Errorf("获取表信息失败: %w", err)
+	}
+
+	// 根据同步模式执行不同的同步策略
+	switch opts.Mode {
+	case backup.SyncModeFull:
+		err = p.syncTableFull(ctx, sourceDB, targetDB, table, columns, primaryKeys, opts, &result)
+	case backup.SyncModeIncremental:
+		err = p.syncTableIncremental(ctx, sourceDB, targetDB, table, columns, primaryKeys, opts, &result)
+	default:
+		return result, fmt.Errorf("不支持的同步模式: %s", opts.Mode)
+	}
+
+	result.Duration = time.Since(startTime)
+	return result, err
+}
+
+// syncTableFull 全量同步表
+func (p *PostgresBackup) syncTableFull(ctx context.Context, sourceDB, targetDB *sql.DB, table string, columns, primaryKeys []string, opts backup.SyncOptions, result *backup.SyncResult) error {
+	// 获取源表总记录数
+	var totalRows int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s", pq.QuoteIdentifier(table))
+	if err := sourceDB.QueryRowContext(ctx, countQuery).Scan(&totalRows); err != nil {
+		return fmt.Errorf("获取源表记录数失败: %w", err)
+	}
+
+	if !opts.DryRun {
+		// 检查目标表是否存在，如果不存在则创建
+		exists, err := p.tableExists(ctx, targetDB, table)
+		if err != nil {
+			return fmt.Errorf("检查目标表是否存在失败: %w", err)
+		}
+		
+		if !exists {
+			// 获取源表结构
+			createSQL, err := p.getTableSchemaFromDB(ctx, sourceDB, table)
+			if err != nil {
+				return fmt.Errorf("获取源表结构失败: %w", err)
+			}
+			
+			// 在目标数据库创建表
+			if _, err := targetDB.ExecContext(ctx, createSQL); err != nil {
+				return fmt.Errorf("创建目标表失败: %w", err)
+			}
+			
+			opts.Logger.Info("已创建目标表", "table", table)
+		} else {
+			// 清空目标表（全量同步）
+			truncateQuery := fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", pq.QuoteIdentifier(table))
+			if _, err := targetDB.ExecContext(ctx, truncateQuery); err != nil {
+				return fmt.Errorf("清空目标表失败: %w", err)
+			}
+		}
+	}
+
+	// 分批读取源数据并插入目标数据库
+	offset := 0
+	for {
+		// 查询源数据
+		selectQuery := fmt.Sprintf("SELECT * FROM %s ORDER BY %s LIMIT $1 OFFSET $2", 
+			pq.QuoteIdentifier(table), strings.Join(primaryKeys, ", "))
+		
+		rows, err := sourceDB.QueryContext(ctx, selectQuery, opts.BatchSize, offset)
+		if err != nil {
+			return fmt.Errorf("查询源数据失败: %w", err)
+		}
+
+		count := 0
+		var insertData [][]interface{}
+
+		for rows.Next() {
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return fmt.Errorf("扫描源数据失败: %w", err)
+			}
+
+			insertData = append(insertData, values)
+			count++
+		}
+		rows.Close()
+
+		// 批量插入目标数据库
+		if len(insertData) > 0 && !opts.DryRun {
+			if err := p.batchInsert(ctx, targetDB, table, columns, insertData); err != nil {
+				return fmt.Errorf("批量插入失败: %w", err)
+			}
+		}
+
+		result.ProcessedRows += int64(count)
+		result.InsertedRows += int64(count)
+
+		// 更新进度
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(table, result.ProcessedRows, totalRows)
+		}
+
+		if count < opts.BatchSize {
+			break
+		}
+		offset += opts.BatchSize
+	}
+
+	return nil
+}
+
+// getAllTablesFromDB 从数据库连接获取所有表名
+func (p *PostgresBackup) getAllTablesFromDB(ctx context.Context, db *sql.DB) ([]string, error) {
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	return p.getAllTables(ctx, tx)
+}
+
+// getTableInfo 获取表的列信息和主键信息
+func (p *PostgresBackup) getTableInfo(ctx context.Context, db *sql.DB, table string) (columns, primaryKeys []string, err error) {
+	// 获取列信息
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	columns, err = p.getTableColumns(ctx, tx, table)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// 获取主键信息
+	pkQuery := `
+		SELECT a.attname
+		FROM pg_constraint c
+		JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+		JOIN pg_class t ON t.oid = c.conrelid
+		WHERE c.contype = 'p' AND t.relname = $1 AND t.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+		ORDER BY array_position(c.conkey, a.attnum)
+	`
+	
+	rows, err := tx.QueryContext(ctx, pkQuery, table)
+	if err != nil {
+		return columns, nil, fmt.Errorf("获取主键信息失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var pkColumn string
+		if err := rows.Scan(&pkColumn); err != nil {
+			return columns, nil, err
+		}
+		primaryKeys = append(primaryKeys, pq.QuoteIdentifier(pkColumn))
+	}
+
+	// 如果没有主键，使用所有列排序（不推荐，但作为备选）
+	if len(primaryKeys) == 0 {
+		for _, col := range columns {
+			primaryKeys = append(primaryKeys, pq.QuoteIdentifier(col))
+		}
+	}
+
+	return columns, primaryKeys, nil
+}
+
+// batchInsert 批量插入数据
+func (p *PostgresBackup) batchInsert(ctx context.Context, db *sql.DB, table string, columns []string, data [][]interface{}) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	// 构建插入语句
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		quotedColumns[i] = pq.QuoteIdentifier(col)
+	}
+
+	// 构建值占位符
+	valuePlaceholders := make([]string, len(data))
+	args := make([]interface{}, 0, len(data)*len(columns))
+	
+	for i, row := range data {
+		placeholders := make([]string, len(columns))
+		for j := range columns {
+			placeholders[j] = fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, row[j])
+		}
+		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
+	}
+
+	insertQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+		pq.QuoteIdentifier(table),
+		strings.Join(quotedColumns, ", "),
+		strings.Join(valuePlaceholders, ", "))
+
+	_, err := db.ExecContext(ctx, insertQuery, args...)
+	return err
+}
+
+// syncTableIncremental 增量同步表
+func (p *PostgresBackup) syncTableIncremental(ctx context.Context, sourceDB, targetDB *sql.DB, table string, columns, primaryKeys []string, opts backup.SyncOptions, result *backup.SyncResult) error {
+	if opts.TimestampColumn == "" {
+		return fmt.Errorf("增量同步必须指定时间戳列名")
+	}
+
+	// 构建时间戳条件
+	var timeCondition string
+	var timeArgs []interface{}
+	if opts.LastSyncTime != nil {
+		timeCondition = fmt.Sprintf("WHERE %s > $1", pq.QuoteIdentifier(opts.TimestampColumn))
+		timeArgs = append(timeArgs, *opts.LastSyncTime)
+	} else {
+		// 如果没有指定最后同步时间，默认同步最近24小时的数据
+		timeCondition = fmt.Sprintf("WHERE %s > NOW() - INTERVAL '24 hours'", pq.QuoteIdentifier(opts.TimestampColumn))
+	}
+
+	// 获取需要同步的记录数
+	var totalRows int64
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s %s", pq.QuoteIdentifier(table), timeCondition)
+	if err := sourceDB.QueryRowContext(ctx, countQuery, timeArgs...).Scan(&totalRows); err != nil {
+		return fmt.Errorf("获取增量记录数失败: %w", err)
+	}
+
+	if totalRows == 0 {
+		opts.Logger.Info("表无增量数据", "table", table)
+		return nil
+	}
+
+	// 分批处理增量数据
+	offset := 0
+	var maxTimestamp *time.Time
+
+	for {
+		// 查询增量数据，按时间戳排序
+		selectQuery := fmt.Sprintf("SELECT * FROM %s %s ORDER BY %s LIMIT $%d OFFSET $%d",
+			pq.QuoteIdentifier(table), timeCondition, pq.QuoteIdentifier(opts.TimestampColumn),
+			len(timeArgs)+1, len(timeArgs)+2)
+		
+		queryArgs := append(timeArgs, opts.BatchSize, offset)
+		rows, err := sourceDB.QueryContext(ctx, selectQuery, queryArgs...)
+		if err != nil {
+			return fmt.Errorf("查询增量数据失败: %w", err)
+		}
+
+		count := 0
+		var upsertData [][]interface{}
+
+		for rows.Next() {
+			values := make([]interface{}, len(columns))
+			valuePtrs := make([]interface{}, len(columns))
+			for i := range columns {
+				valuePtrs[i] = &values[i]
+			}
+
+			if err := rows.Scan(valuePtrs...); err != nil {
+				rows.Close()
+				return fmt.Errorf("扫描增量数据失败: %w", err)
+			}
+
+			// 记录最大时间戳
+			for i, col := range columns {
+				if col == opts.TimestampColumn {
+					if ts, ok := values[i].(time.Time); ok {
+						if maxTimestamp == nil || ts.After(*maxTimestamp) {
+							maxTimestamp = &ts
+						}
+					}
+				}
+			}
+
+			upsertData = append(upsertData, values)
+			count++
+		}
+		rows.Close()
+
+		// 执行 UPSERT 操作
+		if len(upsertData) > 0 && !opts.DryRun {
+			insertedRows, updatedRows, err := p.batchUpsert(ctx, targetDB, table, columns, primaryKeys, upsertData, opts.ConflictStrategy)
+			if err != nil {
+				return fmt.Errorf("批量 UPSERT 失败: %w", err)
+			}
+			result.InsertedRows += insertedRows
+			result.UpdatedRows += updatedRows
+		}
+
+		result.ProcessedRows += int64(count)
+
+		// 更新进度
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(table, result.ProcessedRows, totalRows)
+		}
+
+		if count < opts.BatchSize {
+			break
+		}
+		offset += opts.BatchSize
+	}
+
+	// 记录最后同步时间
+	result.LastSyncTime = maxTimestamp
+
+	return nil
+}
+
+// batchUpsert 批量 UPSERT 操作
+func (p *PostgresBackup) batchUpsert(ctx context.Context, db *sql.DB, table string, columns, primaryKeys []string, data [][]interface{}, strategy backup.ConflictStrategy) (insertedRows, updatedRows int64, err error) {
+	if len(data) == 0 {
+		return 0, 0, nil
+	}
+
+	// 构建 UPSERT 语句
+	quotedColumns := make([]string, len(columns))
+	for i, col := range columns {
+		quotedColumns[i] = pq.QuoteIdentifier(col)
+	}
+
+	// 构建值占位符
+	valuePlaceholders := make([]string, len(data))
+	args := make([]interface{}, 0, len(data)*len(columns))
+	
+	for i, row := range data {
+		placeholders := make([]string, len(columns))
+		for j := range columns {
+			placeholders[j] = fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, row[j])
+		}
+		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
+	}
+
+	// 构建 PRIMARY KEY 约束名（用于冲突检测）
+	pkColumns := make([]string, len(primaryKeys))
+	for i, pk := range primaryKeys {
+		// 移除引号，因为 ON CONFLICT 不需要引号
+		pkColumns[i] = strings.Trim(pk, `"`)
+	}
+
+	var upsertQuery string
+	switch strategy {
+	case backup.ConflictStrategySkip:
+		// 跳过冲突记录
+		upsertQuery = fmt.Sprintf(`
+			INSERT INTO %s (%s) VALUES %s 
+			ON CONFLICT (%s) DO NOTHING`,
+			pq.QuoteIdentifier(table),
+			strings.Join(quotedColumns, ", "),
+			strings.Join(valuePlaceholders, ", "),
+			strings.Join(pkColumns, ", "))
+			
+	case backup.ConflictStrategyOverwrite:
+		// 覆盖冲突记录
+		updateSets := make([]string, 0, len(columns))
+		for _, col := range quotedColumns {
+			if !contains(pkColumns, strings.Trim(col, `"`)) {
+				updateSets = append(updateSets, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
+			}
+		}
+		
+		upsertQuery = fmt.Sprintf(`
+			INSERT INTO %s (%s) VALUES %s 
+			ON CONFLICT (%s) DO UPDATE SET %s`,
+			pq.QuoteIdentifier(table),
+			strings.Join(quotedColumns, ", "),
+			strings.Join(valuePlaceholders, ", "),
+			strings.Join(pkColumns, ", "),
+			strings.Join(updateSets, ", "))
+			
+	case backup.ConflictStrategyFail:
+		// 遇到冲突就失败
+		upsertQuery = fmt.Sprintf(`
+			INSERT INTO %s (%s) VALUES %s`,
+			pq.QuoteIdentifier(table),
+			strings.Join(quotedColumns, ", "),
+			strings.Join(valuePlaceholders, ", "))
+	}
+
+	result, err := db.ExecContext(ctx, upsertQuery, args...)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	
+	// PostgreSQL 的 INSERT ... ON CONFLICT 统计方式：
+	// - 新插入的记录算作 affected rows
+	// - 更新的记录不算作 affected rows (对于 DO UPDATE)
+	// - 跳过的记录不算作 affected rows (对于 DO NOTHING)
+	
+	switch strategy {
+	case backup.ConflictStrategySkip, backup.ConflictStrategyFail:
+		return rowsAffected, 0, nil
+	case backup.ConflictStrategyOverwrite:
+		// 估算插入和更新的数量（PostgreSQL 不提供精确分解）
+		totalExpected := int64(len(data))
+		if rowsAffected < totalExpected {
+			return rowsAffected, totalExpected - rowsAffected, nil
+		}
+		return rowsAffected, 0, nil
+	}
+
+	return rowsAffected, 0, nil
+}
+
+// contains 检查字符串切片是否包含指定字符串
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // 其他辅助方法...

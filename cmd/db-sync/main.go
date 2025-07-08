@@ -144,14 +144,22 @@ func main() {
 	}()
 
 	var (
-		operation   string
-		dbType      string
-		dsn         string
-		file        string
-		batchSize   int
-		tables      string
-		clearBefore bool
-		validate    bool
+		operation         string
+		dbType            string
+		dsn               string
+		file              string
+		batchSize         int
+		tables            string
+		clearBefore       bool
+		validate          bool
+		// 同步相关参数
+		sourceDSN         string
+		targetDSN         string
+		syncMode          string
+		conflictStrategy  string
+		timestampColumn   string
+		lastSyncTime      string
+		dryRun            bool
 	)
 
 	// 定义参数，自动支持长短形式
@@ -164,19 +172,40 @@ func main() {
 	pflag.BoolVarP(&clearBefore, "clear", "C", false, "恢复前是否清空表")
 	pflag.BoolVarP(&validate, "validate", "V", false, "备份后是否验证完整性")
 
+	// 同步相关参数
+	pflag.StringVar(&sourceDSN, "source-dsn", "", "源数据库连接字符串（同步模式）")
+	pflag.StringVar(&targetDSN, "target-dsn", "", "目标数据库连接字符串（同步模式）")
+	pflag.StringVar(&syncMode, "sync-mode", "full", "同步模式: full/incremental")
+	pflag.StringVar(&conflictStrategy, "conflict-strategy", "overwrite", "冲突处理策略: skip/overwrite/fail")
+	pflag.StringVar(&timestampColumn, "timestamp-column", "", "增量同步时间戳列名")
+	pflag.StringVar(&lastSyncTime, "last-sync-time", "", "上次同步时间 (RFC3339格式)")
+	pflag.BoolVar(&dryRun, "dry-run", false, "试运行模式，不实际修改数据")
+
 	pflag.Parse()
 
 	// 检查必需参数并提供友好的错误提示
 	var missingFlags []string
 	if operation == "" {
 		missingFlags = append(missingFlags, "--op")
-	} else if operation != "sync" && operation != "load" {
-		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync 或 load\n", operation)
+	} else if operation != "sync" && operation != "load" && operation != "sync-db" {
+		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync/load/sync-db\n", operation)
 		os.Exit(1)
 	}
 
-	if dsn == "" {
-		missingFlags = append(missingFlags, "--dsn")
+	// 根据操作类型检查不同的必需参数
+	if operation == "sync-db" {
+		// 同步模式需要 source-dsn 和 target-dsn
+		if sourceDSN == "" {
+			missingFlags = append(missingFlags, "--source-dsn")
+		}
+		if targetDSN == "" {
+			missingFlags = append(missingFlags, "--target-dsn")
+		}
+	} else {
+		// 备份和恢复模式需要 dsn
+		if dsn == "" {
+			missingFlags = append(missingFlags, "--dsn")
+		}
 	}
 
 	if len(missingFlags) > 0 {
@@ -187,13 +216,22 @@ func main() {
 		fmt.Println("\n使用示例:")
 		fmt.Printf("  备份数据库:   %s --op sync --dsn \"postgresql://user:***@host:port/dbname\"\n", os.Args[0])
 		fmt.Printf("  恢复数据库:   %s --op load --dsn \"postgresql://user:***@host:port/dbname\" --file backup.sql\n", os.Args[0])
+		fmt.Printf("  同步数据库:   %s --op sync-db --source-dsn \"postgresql://user:***@host:port/dbname\" --target-dsn \"postgresql://user:***@host:port/dbname\"\n", os.Args[0])
 		fmt.Println("\n可用的参数:")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
 	// 自动检测数据库类型
-	detectedType := detectDBType(dsn)
+	var detectedType string
+	if operation == "sync-db" {
+		// 对于同步操作，从源DSN检测类型
+		detectedType = detectDBType(sourceDSN)
+	} else {
+		// 对于备份/恢复操作，从DSN检测类型
+		detectedType = detectDBType(dsn)
+	}
+	
 	if detectedType == "" && dbType == "" {
 		fmt.Println("错误: 无法从DSN自动识别数据库类型，请使用 --type 参数指定数据库类型 (postgres/mysql)")
 		os.Exit(1)
@@ -320,6 +358,177 @@ func main() {
 		fmt.Println() // 换行
 		if err != nil {
 			fmt.Printf("恢复失败: %v [DSN: %s]\n", err, sanitizeDSN(dsn))
+			os.Exit(1)
+		}
+
+	case "sync-db":
+		// 验证同步参数
+		if sourceDSN == "" {
+			fmt.Println("错误: 同步模式需要指定源数据库连接字符串 (--source-dsn)")
+			os.Exit(1)
+		}
+		if targetDSN == "" {
+			fmt.Println("错误: 同步模式需要指定目标数据库连接字符串 (--target-dsn)")
+			os.Exit(1)
+		}
+
+		// 从源 DSN 检测数据库类型
+		sourceFinalDBType := detectDBType(sourceDSN)
+		if sourceFinalDBType == "" && dbType == "" {
+			fmt.Println("错误: 无法从源DSN自动识别数据库类型，请使用 --type 参数指定数据库类型")
+			os.Exit(1)
+		}
+		if dbType != "" {
+			sourceFinalDBType = dbType
+		}
+
+		// 检测目标数据库类型
+		targetFinalDBType := detectDBType(targetDSN)
+		if targetFinalDBType != sourceFinalDBType {
+			fmt.Printf("警告: 源数据库类型 (%s) 与目标数据库类型 (%s) 不一致\n", sourceFinalDBType, targetFinalDBType)
+		}
+
+		// 解析同步选项
+		var mode backup.SyncMode
+		switch syncMode {
+		case "full":
+			mode = backup.SyncModeFull
+		case "incremental":
+			mode = backup.SyncModeIncremental
+		default:
+			fmt.Printf("错误: 不支持的同步模式 '%s'，必须是 full 或 incremental\n", syncMode)
+			os.Exit(1)
+		}
+
+		var strategy backup.ConflictStrategy
+		switch conflictStrategy {
+		case "skip":
+			strategy = backup.ConflictStrategySkip
+		case "overwrite":
+			strategy = backup.ConflictStrategyOverwrite
+		case "fail":
+			strategy = backup.ConflictStrategyFail
+		default:
+			fmt.Printf("错误: 不支持的冲突策略 '%s'，必须是 skip/overwrite/fail\n", conflictStrategy)
+			os.Exit(1)
+		}
+
+		// 解析最后同步时间
+		var lastSync *time.Time
+		if lastSyncTime != "" {
+			if parsedTime, err := time.Parse(time.RFC3339, lastSyncTime); err != nil {
+				fmt.Printf("错误: 无效的时间格式 '%s'，请使用 RFC3339 格式 (如: 2006-01-02T15:04:05Z)\n", lastSyncTime)
+				os.Exit(1)
+			} else {
+				lastSync = &parsedTime
+			}
+		}
+
+		// 增量同步模式验证
+		if mode == backup.SyncModeIncremental && timestampColumn == "" {
+			fmt.Println("错误: 增量同步模式必须指定时间戳列名 (--timestamp-column)")
+			os.Exit(1)
+		}
+
+		// 创建数据库实例
+		var dbInstance backup.DatabaseBackup
+		switch sourceFinalDBType {
+		case "postgres":
+			dbInstance = postgres.NewPostgresBackup(logger)
+		case "mysql":
+			dbInstance = mysql.NewMySQLBackup(logger)
+		default:
+			fmt.Printf("错误: 不支持的数据库类型: %s\n", sourceFinalDBType)
+			os.Exit(1)
+		}
+
+		// 设置进度显示回调
+		var lastTable string
+		progressCallback := func(tableName string, processed, total int64) {
+			// 如果是新表，先换行
+			if tableName != lastTable {
+				if lastTable != "" {
+					fmt.Println() // 为之前的表换行
+				}
+				lastTable = tableName
+			}
+			
+			if total > 0 {
+				percent := float64(processed) / float64(total) * 100
+				fmt.Printf("\r同步表 %s: %d/%d (%.1f%%)   ", tableName, processed, total, percent)
+			} else {
+				fmt.Printf("\r同步表 %s: %d 条记录   ", tableName, processed)
+			}
+			
+			// 如果处理完成，换行
+			if processed == total && total > 0 {
+				fmt.Println()
+			}
+		}
+
+		// 执行数据库同步
+		results, err := dbInstance.SyncDatabase(ctx, sourceDSN, targetDSN, backup.SyncOptions{
+			Mode:             mode,
+			Tables:           tableList,
+			BatchSize:        batchSize,
+			ConflictStrategy: strategy,
+			TimestampColumn:  timestampColumn,
+			LastSyncTime:     lastSync,
+			DryRun:           dryRun,
+			Logger:           logger,
+			ProgressCallback: progressCallback,
+		})
+		fmt.Println() // 换行
+
+		if err != nil {
+			fmt.Printf("同步失败: %v\n", err)
+			os.Exit(1)
+		}
+
+		// 显示同步结果
+		fmt.Printf("\n=== 同步完成 ===\n")
+		var totalProcessed, totalInserted, totalUpdated, totalSkipped, totalErrors int64
+		allSuccess := true
+
+		for _, result := range results {
+			if result.ErrorMessage != "" {
+				fmt.Printf("❌ 表 %s: 同步失败 - %s\n", result.TableName, result.ErrorMessage)
+				allSuccess = false
+			} else {
+				fmt.Printf("✅ 表 %s: ", result.TableName)
+				if mode == backup.SyncModeFull {
+					fmt.Printf("全量同步 %d 条记录", result.InsertedRows)
+				} else {
+					fmt.Printf("增量同步 %d 条 (新增: %d, 更新: %d, 跳过: %d)", 
+						result.ProcessedRows, result.InsertedRows, result.UpdatedRows, result.SkippedRows)
+				}
+				fmt.Printf(" 耗时: %v\n", result.Duration)
+				
+				if result.LastSyncTime != nil {
+					fmt.Printf("   最新时间戳: %s\n", result.LastSyncTime.Format(time.RFC3339))
+				}
+			}
+
+			totalProcessed += result.ProcessedRows
+			totalInserted += result.InsertedRows
+			totalUpdated += result.UpdatedRows
+			totalSkipped += result.SkippedRows
+			totalErrors += result.ErrorRows
+		}
+
+		fmt.Printf("\n=== 总计 ===\n")
+		fmt.Printf("处理记录: %d\n", totalProcessed)
+		fmt.Printf("新增记录: %d\n", totalInserted)
+		if mode == backup.SyncModeIncremental {
+			fmt.Printf("更新记录: %d\n", totalUpdated)
+			fmt.Printf("跳过记录: %d\n", totalSkipped)
+		}
+		if totalErrors > 0 {
+			fmt.Printf("错误记录: %d\n", totalErrors)
+		}
+
+		if !allSuccess {
+			fmt.Println("同步过程中存在错误，请检查上述输出")
 			os.Exit(1)
 		}
 
