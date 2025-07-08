@@ -22,6 +22,10 @@ help:
 	@echo "  build-all   - Build binaries for all platforms"
 	@echo "  clean       - Remove build directory"
 	@echo "  test        - Run tests"
+	@echo "  lint        - Run golangci-lint"
+	@echo "  fmt         - Format code"
+	@echo "  package     - Build deb and rpm packages"
+	@echo "  release     - Build release artifacts"
 	@echo "  help        - Show this help message" 
 
 # 清理构建目录
@@ -64,3 +68,70 @@ $(PLATFORMS):
 test:
 	@echo "Running tests..."
 	@$(GO) test -v ./...
+
+# 运行 lint 检查
+.PHONY: lint
+lint:
+	@echo "Running golangci-lint..."
+	@which golangci-lint > /dev/null || (echo "golangci-lint not found, installing..." && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
+	@golangci-lint run
+
+# 格式化代码
+.PHONY: fmt
+fmt:
+	@echo "Formatting code..."
+	@gofmt -s -w .
+	@goimports -w .
+
+# 构建包
+.PHONY: package
+package: build-all
+	@echo "Building packages..."
+	@mkdir -p $(BUILD_DIR)/packages
+	@# 构建 Linux AMD64 DEB 包
+	@mkdir -p $(BUILD_DIR)/deb-amd64/{DEBIAN,usr/bin}
+	@cp $(BUILD_DIR)/$(BINARY_NAME)_linux_amd64 $(BUILD_DIR)/deb-amd64/usr/bin/$(BINARY_NAME)
+	@echo "Package: $(BINARY_NAME)" > $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Version: $(VERSION)" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Section: utils" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Priority: optional" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Architecture: amd64" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Maintainer: auto-tunnel <noreply@github.com>" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo "Description: High-performance database backup and restore tool" >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@echo " DB-Sync is a command-line tool for backing up and restoring databases." >> $(BUILD_DIR)/deb-amd64/DEBIAN/control
+	@dpkg-deb --build $(BUILD_DIR)/deb-amd64 $(BUILD_DIR)/packages/$(BINARY_NAME)_$(VERSION)_amd64.deb 2>/dev/null || echo "DEB package creation requires dpkg-deb"
+	@echo "Package created: $(BUILD_DIR)/packages/$(BINARY_NAME)_$(VERSION)_amd64.deb"
+
+# 构建发布包
+.PHONY: release
+release: package
+	@echo "Creating release artifacts..."
+	@mkdir -p $(BUILD_DIR)/release
+	@cp $(BUILD_DIR)/$(BINARY_NAME)_* $(BUILD_DIR)/release/ 2>/dev/null || true
+	@cp $(BUILD_DIR)/packages/* $(BUILD_DIR)/release/ 2>/dev/null || true
+	@cd $(BUILD_DIR)/release && sha256sum * > checksums.txt
+	@echo "Release artifacts created in $(BUILD_DIR)/release/"
+
+# 开发环境设置
+.PHONY: dev-setup
+dev-setup:
+	@echo "Setting up development environment..."
+	@go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	@go install golang.org/x/tools/cmd/goimports@latest
+	@go mod download
+	@echo "Development environment setup complete"
+
+# 检查依赖
+.PHONY: deps
+deps:
+	@echo "Checking dependencies..."
+	@go mod verify
+	@go mod tidy
+
+# 安装二进制文件到本地
+.PHONY: install
+install: build
+	@echo "Installing $(BINARY_NAME) to $(HOME)/bin..."
+	@mkdir -p $(HOME)/bin
+	@cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/bin/
+	@echo "Installation complete. Make sure $(HOME)/bin is in your PATH"

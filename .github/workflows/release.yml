@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+        default: 'v0.1.0'
+
+env:
+  GO_VERSION: '1.23'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, windows, darwin]
+        arch: [amd64, arm64]
+        exclude:
+          - os: windows
+            arch: arm64
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Get dependencies
+      run: go mod download
+    
+    - name: Build binary
+      env:
+        GOOS: ${{ matrix.os }}
+        GOARCH: ${{ matrix.arch }}
+      run: |
+        mkdir -p build
+        if [ "${{ matrix.os }}" = "windows" ]; then
+          go build -ldflags="-s -w" -o build/db-sync-${{ matrix.os }}-${{ matrix.arch }}.exe ./cmd/db-sync
+        else
+          go build -ldflags="-s -w" -o build/db-sync-${{ matrix.os }}-${{ matrix.arch }} ./cmd/db-sync
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: db-sync-${{ matrix.os }}-${{ matrix.arch }}
+        path: build/
+
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Setup packaging tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rpm devscripts debhelper
+    
+    - name: Create package structure
+      run: |
+        mkdir -p packaging/{deb,rpm}
+        
+        # Copy binaries
+        cp artifacts/db-sync-linux-amd64/db-sync-linux-amd64 packaging/db-sync-linux-amd64
+        cp artifacts/db-sync-linux-arm64/db-sync-linux-arm64 packaging/db-sync-linux-arm64
+        
+        chmod +x packaging/db-sync-linux-*
+    
+    - name: Create DEB package (amd64)
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        if [ -z "$VERSION" ]; then
+          VERSION=${{ github.event.inputs.tag }}
+          VERSION=${VERSION#v}
+        fi
+        
+        mkdir -p deb-amd64/{DEBIAN,usr/bin}
+        
+        # Copy binary
+        cp packaging/db-sync-linux-amd64 deb-amd64/usr/bin/db-sync
+        
+        # Create control file
+        cat > deb-amd64/DEBIAN/control << EOF
+        Package: db-sync
+        Version: ${VERSION}
+        Section: utils
+        Priority: optional
+        Architecture: amd64
+        Maintainer: auto-tunnel <noreply@github.com>
+        Description: High-performance database backup and restore tool
+         DB-Sync is a command-line tool for backing up and restoring databases.
+         It supports PostgreSQL and MySQL databases with features like:
+         - Batch processing for large datasets
+         - Transaction guarantees for data consistency
+         - Flexible backup and restore options
+         - Graceful shutdown support
+        EOF
+        
+        # Build DEB package
+        dpkg-deb --build deb-amd64 db-sync_${VERSION}_amd64.deb
+    
+    - name: Create DEB package (arm64)
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        if [ -z "$VERSION" ]; then
+          VERSION=${{ github.event.inputs.tag }}
+          VERSION=${VERSION#v}
+        fi
+        
+        mkdir -p deb-arm64/{DEBIAN,usr/bin}
+        
+        # Copy binary
+        cp packaging/db-sync-linux-arm64 deb-arm64/usr/bin/db-sync
+        
+        # Create control file
+        cat > deb-arm64/DEBIAN/control << EOF
+        Package: db-sync
+        Version: ${VERSION}
+        Section: utils
+        Priority: optional
+        Architecture: arm64
+        Maintainer: auto-tunnel <noreply@github.com>
+        Description: High-performance database backup and restore tool
+         DB-Sync is a command-line tool for backing up and restoring databases.
+         It supports PostgreSQL and MySQL databases with features like:
+         - Batch processing for large datasets
+         - Transaction guarantees for data consistency
+         - Flexible backup and restore options
+         - Graceful shutdown support
+        EOF
+        
+        # Build DEB package
+        dpkg-deb --build deb-arm64 db-sync_${VERSION}_arm64.deb
+    
+    - name: Create RPM package (amd64)
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        if [ -z "$VERSION" ]; then
+          VERSION=${{ github.event.inputs.tag }}
+          VERSION=${VERSION#v}
+        fi
+        
+        mkdir -p rpm-build/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+        
+        # Create spec file
+        cat > rpm-build/SPECS/db-sync.spec << EOF
+        Name:           db-sync
+        Version:        ${VERSION}
+        Release:        1%{?dist}
+        Summary:        High-performance database backup and restore tool
+        License:        MIT
+        URL:            https://github.com/auto-tunnel/db-sync
+        Source0:        db-sync-linux-amd64
+        
+        %description
+        DB-Sync is a command-line tool for backing up and restoring databases.
+        It supports PostgreSQL and MySQL databases with features like:
+        - Batch processing for large datasets
+        - Transaction guarantees for data consistency
+        - Flexible backup and restore options
+        - Graceful shutdown support
+        
+        %prep
+        
+        %build
+        
+        %install
+        mkdir -p %{buildroot}/usr/bin
+        cp %{SOURCE0} %{buildroot}/usr/bin/db-sync
+        chmod +x %{buildroot}/usr/bin/db-sync
+        
+        %files
+        /usr/bin/db-sync
+        
+        %changelog
+        * $(date "+%a %b %d %Y") auto-tunnel <noreply@github.com> - ${VERSION}-1
+        - Release ${VERSION}
+        EOF
+        
+        # Copy source
+        cp packaging/db-sync-linux-amd64 rpm-build/SOURCES/
+        
+        # Build RPM
+        rpmbuild --define "_topdir $(pwd)/rpm-build" -bb rpm-build/SPECS/db-sync.spec
+        
+        # Copy result
+        cp rpm-build/RPMS/x86_64/db-sync-${VERSION}-1.*.rpm ./db-sync_${VERSION}_amd64.rpm
+    
+    - name: Create RPM package (arm64)
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        if [ -z "$VERSION" ]; then
+          VERSION=${{ github.event.inputs.tag }}
+          VERSION=${VERSION#v}
+        fi
+        
+        mkdir -p rpm-build-arm64/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+        
+        # Create spec file
+        cat > rpm-build-arm64/SPECS/db-sync.spec << EOF
+        Name:           db-sync
+        Version:        ${VERSION}
+        Release:        1%{?dist}
+        Summary:        High-performance database backup and restore tool
+        License:        MIT
+        URL:            https://github.com/auto-tunnel/db-sync
+        Source0:        db-sync-linux-arm64
+        
+        %description
+        DB-Sync is a command-line tool for backing up and restoring databases.
+        It supports PostgreSQL and MySQL databases with features like:
+        - Batch processing for large datasets
+        - Transaction guarantees for data consistency
+        - Flexible backup and restore options
+        - Graceful shutdown support
+        
+        %prep
+        
+        %build
+        
+        %install
+        mkdir -p %{buildroot}/usr/bin
+        cp %{SOURCE0} %{buildroot}/usr/bin/db-sync
+        chmod +x %{buildroot}/usr/bin/db-sync
+        
+        %files
+        /usr/bin/db-sync
+        
+        %changelog
+        * $(date "+%a %b %d %Y") auto-tunnel <noreply@github.com> - ${VERSION}-1
+        - Release ${VERSION}
+        EOF
+        
+        # Copy source
+        cp packaging/db-sync-linux-arm64 rpm-build-arm64/SOURCES/
+        
+        # Build RPM
+        rpmbuild --define "_topdir $(pwd)/rpm-build-arm64" --target aarch64 -bb rpm-build-arm64/SPECS/db-sync.spec
+        
+        # Copy result
+        cp rpm-build-arm64/RPMS/aarch64/db-sync-${VERSION}-1.*.rpm ./db-sync_${VERSION}_arm64.rpm
+    
+    - name: Upload package artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: packages
+        path: |
+          *.deb
+          *.rpm
+
+  release:
+    needs: [build, package]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Prepare release assets
+      run: |
+        mkdir -p release-assets
+        
+        # Copy binaries
+        for dir in artifacts/db-sync-*/; do
+          if [ -d "$dir" ]; then
+            cp "$dir"/* release-assets/ 2>/dev/null || true
+          fi
+        done
+        
+        # Copy packages
+        cp artifacts/packages/*.deb release-assets/ 2>/dev/null || true
+        cp artifacts/packages/*.rpm release-assets/ 2>/dev/null || true
+        
+        # Create checksums
+        cd release-assets
+        sha256sum * > checksums.txt
+        cd ..
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release-assets/*
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
