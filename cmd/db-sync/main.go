@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"regexp"
 	"os/signal"
-	"sync"
 	"syscall"
 
 	"github.com/spf13/pflag"
@@ -130,14 +129,18 @@ func main() {
 	// 监听信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	var wg sync.WaitGroup
+	defer signal.Stop(sigChan) // 确保清理信号监听
 
-	wg.Add(1)
+	// 信号处理
 	go func() {
-		defer wg.Done()
-		<-sigChan
-		fmt.Println("\n收到停机信号，正在优雅停机...")
-		cancel()
+		select {
+		case <-sigChan:
+			fmt.Println("\n收到停机信号，正在优雅停机...")
+			cancel()
+		case <-ctx.Done():
+			// 正常完成或被取消，退出 goroutine
+			return
+		}
 	}()
 
 	var (
@@ -325,17 +328,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 等待所有 goroutine 完成
-	wg.Wait()
-
-	// 检查是否因为取消而退出
+	// 检查是否被用户取消
 	select {
 	case <-ctx.Done():
-		fmt.Println("操作被取消")
-		os.Exit(130) // SIGINT 退出码
+		// 检查取消原因
+		if ctx.Err() == context.Canceled {
+			fmt.Println("操作被用户取消")
+			os.Exit(130) // SIGINT 退出码
+		}
 	default:
-		fmt.Println("操作完成")
+		// 正常完成
 	}
+
+	fmt.Println("操作完成")
 }
 
 // 添加辅助函数：从 DSN 中提取数据库名称
