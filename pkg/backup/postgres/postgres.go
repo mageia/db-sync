@@ -786,6 +786,23 @@ func (p *PostgresBackup) SyncDatabase(ctx context.Context, sourceDSN, targetDSN 
 		}
 	}
 
+	// 同步序列 (id_seq)
+	if err := p.syncSequences(ctx, sourceDB, targetDB, tables, opts); err != nil {
+		opts.Logger.Error("同步序列失败", "error", err)
+		// 为序列同步创建结果记录
+		seqResult := backup.SyncResult{
+			TableName:    "sequences",
+			ErrorMessage: fmt.Sprintf("同步序列失败: %v", err),
+		}
+		results = append(results, seqResult)
+		
+		if opts.ConflictStrategy == backup.ConflictStrategyFail {
+			return results, fmt.Errorf("同步序列失败: %w", err)
+		}
+	} else {
+		opts.Logger.Info("序列同步完成")
+	}
+
 	return results, nil
 }
 
@@ -1214,6 +1231,192 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// syncSequences 同步序列
+func (p *PostgresBackup) syncSequences(ctx context.Context, sourceDB, targetDB *sql.DB, tables []string, opts backup.SyncOptions) error {
+	// 获取源数据库中的序列信息
+	sequences, err := p.getSequenceInfo(ctx, sourceDB, tables)
+	if err != nil {
+		return fmt.Errorf("获取源数据库序列信息失败: %w", err)
+	}
+
+	if len(sequences) == 0 {
+		opts.Logger.Info("没有找到需要同步的序列")
+		return nil
+	}
+
+	opts.Logger.Info("开始同步序列", "count", len(sequences))
+
+	// 逐个同步序列
+	for _, seq := range sequences {
+		if opts.DryRun {
+			opts.Logger.Info("试运行：将同步序列", "sequence", seq.Name, "last_value", seq.LastValue)
+			continue
+		}
+
+		// 创建或更新序列
+		if err := p.createOrUpdateSequence(ctx, targetDB, seq); err != nil {
+			return fmt.Errorf("同步序列 %s 失败: %w", seq.Name, err)
+		}
+
+		opts.Logger.Info("序列同步完成", "sequence", seq.Name, "last_value", seq.LastValue)
+	}
+
+	return nil
+}
+
+// SequenceInfo 序列信息结构
+type SequenceInfo struct {
+	Name        string
+	StartValue  sql.NullInt64
+	IncrementBy sql.NullInt64
+	MaxValue    sql.NullInt64
+	MinValue    sql.NullInt64
+	CacheSize   sql.NullInt64
+	LastValue   sql.NullInt64
+	Cycle       bool
+}
+
+// getSequenceInfo 获取序列信息
+func (p *PostgresBackup) getSequenceInfo(ctx context.Context, db *sql.DB, tables []string) ([]SequenceInfo, error) {
+	var query string
+	var args []interface{}
+
+	if len(tables) == 0 {
+		// 获取所有序列
+		query = `
+			SELECT
+				sequencename as sequence_name,
+				start_value,
+				increment_by,
+				max_value,
+				min_value,
+				cache_size,
+				last_value,
+				cycle
+			FROM pg_sequences
+			WHERE schemaname = 'public'
+			ORDER BY sequencename
+		`
+	} else {
+		// 只获取指定表相关的序列
+		query = `
+			SELECT
+				s.sequencename as sequence_name,
+				s.start_value,
+				s.increment_by,
+				s.max_value,
+				s.min_value,
+				s.cache_size,
+				s.last_value,
+				s.cycle
+			FROM pg_sequences s
+			WHERE s.schemaname = 'public'
+			AND (
+				s.sequencename = ANY($1) OR
+				EXISTS (
+					SELECT 1 FROM unnest($1) as t(table_name)
+					WHERE s.sequencename LIKE t.table_name || '_%_seq'
+				)
+			)
+			ORDER BY s.sequencename
+		`
+		args = append(args, pq.Array(tables))
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("查询序列信息失败: %w", err)
+	}
+	defer rows.Close()
+
+	var sequences []SequenceInfo
+	for rows.Next() {
+		var seq SequenceInfo
+		if err := rows.Scan(
+			&seq.Name,
+			&seq.StartValue,
+			&seq.IncrementBy,
+			&seq.MaxValue,
+			&seq.MinValue,
+			&seq.CacheSize,
+			&seq.LastValue,
+			&seq.Cycle,
+		); err != nil {
+			return nil, fmt.Errorf("扫描序列信息失败: %w", err)
+		}
+		sequences = append(sequences, seq)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("序列信息查询出错: %w", err)
+	}
+
+	return sequences, nil
+}
+
+// createOrUpdateSequence 创建或更新序列
+func (p *PostgresBackup) createOrUpdateSequence(ctx context.Context, db *sql.DB, seq SequenceInfo) error {
+	// 检查序列是否存在
+	var exists bool
+	checkQuery := `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_sequences
+			WHERE schemaname = 'public' AND sequencename = $1
+		)
+	`
+	if err := db.QueryRowContext(ctx, checkQuery, seq.Name).Scan(&exists); err != nil {
+		return fmt.Errorf("检查序列是否存在失败: %w", err)
+	}
+
+	if !exists {
+		// 创建新序列
+		if err := p.createSequence(ctx, db, seq); err != nil {
+			return fmt.Errorf("创建序列失败: %w", err)
+		}
+	}
+
+	// 更新序列当前值
+	if seq.LastValue.Valid {
+		setValueQuery := fmt.Sprintf("SELECT setval('%s', $1, true)", seq.Name)
+		if _, err := db.ExecContext(ctx, setValueQuery, seq.LastValue.Int64); err != nil {
+			return fmt.Errorf("设置序列当前值失败: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// createSequence 创建序列
+func (p *PostgresBackup) createSequence(ctx context.Context, db *sql.DB, seq SequenceInfo) error {
+	var createSQL strings.Builder
+	createSQL.WriteString(fmt.Sprintf("CREATE SEQUENCE %s", pq.QuoteIdentifier(seq.Name)))
+
+	if seq.IncrementBy.Valid {
+		createSQL.WriteString(fmt.Sprintf(" INCREMENT BY %d", seq.IncrementBy.Int64))
+	}
+	if seq.MinValue.Valid {
+		createSQL.WriteString(fmt.Sprintf(" MINVALUE %d", seq.MinValue.Int64))
+	}
+	if seq.MaxValue.Valid {
+		createSQL.WriteString(fmt.Sprintf(" MAXVALUE %d", seq.MaxValue.Int64))
+	}
+	if seq.StartValue.Valid {
+		createSQL.WriteString(fmt.Sprintf(" START WITH %d", seq.StartValue.Int64))
+	}
+	if seq.CacheSize.Valid {
+		createSQL.WriteString(fmt.Sprintf(" CACHE %d", seq.CacheSize.Int64))
+	}
+	if seq.Cycle {
+		createSQL.WriteString(" CYCLE")
+	}
+
+	if _, err := db.ExecContext(ctx, createSQL.String()); err != nil {
+		return fmt.Errorf("执行创建序列SQL失败: %w", err)
+	}
+
+	return nil
 }
 
 // 其他辅助方法...
