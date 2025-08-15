@@ -1,6 +1,6 @@
 # 设置基本变量
 BINARY_NAME=db-sync
-VERSION=1.0.0
+VERSION=0.1.3
 BUILD_DIR=build
 MAIN_PATH=cmd/db-sync/main.go
 

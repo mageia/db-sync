@@ -123,33 +123,91 @@ db-sync -op load \
 
 #### MySQL 示例
 
-1. **备份 MySQL 数据库：**
+1. **备份整个数据库：**
 ```bash
 db-sync -op sync \
     -type mysql \
-    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4" \
+    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local" \
     -file backup.sql
 ```
 
-2. **恢复 MySQL 数据库（清空已存在的表）：**
+2. **备份指定表：**
+```bash
+db-sync -op sync \
+    -type mysql \
+    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local" \
+    -file backup.sql \
+    -tables "users,orders,products"
+```
+
+3. **恢复整个数据库：**
 ```bash
 db-sync -op load \
     -type mysql \
-    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4" \
+    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local" \
+    -file backup.sql
+```
+
+4. **恢复指定表（清空已存在的表）：**
+```bash
+db-sync -op load \
+    -type mysql \
+    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local" \
     -file backup.sql \
-    -tables "table1,table2" \
+    -tables "users,orders" \
     -clear
+```
+
+5. **使用自定义批处理大小备份大数据量表：**
+```bash
+db-sync -op sync \
+    -type mysql \
+    -dsn "user:pass@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local" \
+    -file backup.sql \
+    -batch-size 10000
 ```
 
 #### 高级选项
 
-1. **使用自定义批处理大小：**
+1. **PostgreSQL 使用自定义批处理大小：**
 ```bash
 db-sync -op sync \
     -type postgres \
     -dsn "postgres://user:pass@localhost:5432/dbname?sslmode=disable" \
     -file backup.sql \
     -batch-size 5000
+```
+
+2. **MySQL 跨数据库同步（从一个数据库备份并恢复到另一个数据库）：**
+```bash
+# 从生产环境备份
+db-sync -op sync \
+    -type mysql \
+    -dsn "user:pass@tcp(prod-server:3306)/prod_db?charset=utf8mb4&parseTime=True&loc=Local" \
+    -file prod_backup.sql \
+    -tables "users,orders,products"
+
+# 恢复到测试环境
+db-sync -op load \
+    -type mysql \
+    -dsn "user:pass@tcp(test-server:3306)/test_db?charset=utf8mb4&parseTime=True&loc=Local" \
+    -file prod_backup.sql \
+    -clear
+```
+
+3. **PostgreSQL 跨数据库同步：**
+```bash
+# 从源数据库备份
+db-sync -op sync \
+    -type postgres \
+    -dsn "postgres://user:pass@source-host:5432/source_db?sslmode=disable" \
+    -file migration.sql
+
+# 恢复到目标数据库
+db-sync -op load \
+    -type postgres \
+    -dsn "postgres://user:pass@target-host:5432/target_db?sslmode=disable" \
+    -file migration.sql
 ```
 
 ## ⚠️ 注意事项

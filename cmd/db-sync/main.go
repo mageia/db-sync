@@ -8,13 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"strings"
-	"time"
 	"net/url"
-	"regexp"
+	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/pflag"
 )
@@ -144,26 +144,26 @@ func main() {
 	}()
 
 	var (
-		operation         string
-		dbType            string
-		dsn               string
-		file              string
-		batchSize         int
-		tables            string
-		clearBefore       bool
-		validate          bool
+		operation   string
+		dbType      string
+		dsn         string
+		file        string
+		batchSize   int
+		tables      string
+		clearBefore bool
+		validate    bool
 		// 同步相关参数
-		sourceDSN         string
-		targetDSN         string
-		syncMode          string
-		conflictStrategy  string
-		timestampColumn   string
-		lastSyncTime      string
-		dryRun            bool
+		sourceDSN        string
+		targetDSN        string
+		syncMode         string
+		conflictStrategy string
+		timestampColumn  string
+		lastSyncTime     string
+		dryRun           bool
 	)
 
 	// 定义参数，自动支持长短形式
-	pflag.StringVarP(&operation, "op", "o", "", "操作类型: sync/load")
+	pflag.StringVarP(&operation, "op", "o", "", "操作类型: sync/load/sync-db")
 	pflag.StringVarP(&dbType, "type", "t", "", "数据库类型: postgres/mysql (可选，通常可以从DSN自动识别)")
 	pflag.StringVarP(&dsn, "dsn", "d", "", "数据库连接字符串")
 	pflag.StringVarP(&file, "file", "f", "", "备份文件路径")
@@ -180,6 +180,50 @@ func main() {
 	pflag.StringVar(&timestampColumn, "timestamp-column", "", "增量同步时间戳列名")
 	pflag.StringVar(&lastSyncTime, "last-sync-time", "", "上次同步时间 (RFC3339格式)")
 	pflag.BoolVar(&dryRun, "dry-run", false, "试运行模式，不实际修改数据")
+
+	// 自定义 help 函数
+	pflag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "db-sync - 数据库备份、恢复与同步工具\n\n")
+		fmt.Fprintf(os.Stderr, "使用方法:\n")
+		fmt.Fprintf(os.Stderr, "  %s [选项]\n\n", os.Args[0])
+
+		fmt.Fprintf(os.Stderr, "选项:\n")
+		pflag.PrintDefaults()
+
+		fmt.Fprintf(os.Stderr, "\nDSN 格式示例:\n")
+		fmt.Fprintf(os.Stderr, "  PostgreSQL:\n")
+		fmt.Fprintf(os.Stderr, "    - URL格式:        postgresql://username:password@localhost:5432/dbname?sslmode=disable\n")
+		fmt.Fprintf(os.Stderr, "    - 连接字符串格式: host=localhost port=5432 user=username password=password dbname=mydb sslmode=disable\n")
+		fmt.Fprintf(os.Stderr, "    - 简化格式:       postgres://user:pass@localhost/mydb\n\n")
+
+		fmt.Fprintf(os.Stderr, "  MySQL:\n")
+		fmt.Fprintf(os.Stderr, "    - 标准格式:       username:password@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True\n")
+		fmt.Fprintf(os.Stderr, "    - Unix套接字:     username:password@unix(/var/run/mysqld/mysqld.sock)/dbname\n")
+		fmt.Fprintf(os.Stderr, "    - 简化格式:       user:pass@tcp(localhost)/mydb\n\n")
+
+		fmt.Fprintf(os.Stderr, "使用示例:\n")
+		fmt.Fprintf(os.Stderr, "  备份 PostgreSQL 数据库:\n")
+		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"postgresql://user:pass@localhost:5432/mydb\"\n\n", os.Args[0])
+
+		fmt.Fprintf(os.Stderr, "  恢复 PostgreSQL 数据库:\n")
+		fmt.Fprintf(os.Stderr, "    %s --op load --dsn \"postgresql://user:pass@localhost:5432/mydb\" --file backup.sql\n\n", os.Args[0])
+
+		fmt.Fprintf(os.Stderr, "  同步 PostgreSQL 数据库:\n")
+		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "      --source-dsn \"postgresql://user:pass@source:5432/sourcedb\" \\\n")
+		fmt.Fprintf(os.Stderr, "      --target-dsn \"postgresql://user:pass@target:5432/targetdb\"\n\n")
+
+		fmt.Fprintf(os.Stderr, "  备份 MySQL 数据库特定表:\n")
+		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"user:pass@tcp(localhost:3306)/mydb\" --tables \"users,orders\"\n\n", os.Args[0])
+
+		fmt.Fprintf(os.Stderr, "  增量同步 MySQL 数据库:\n")
+		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "      --source-dsn \"user:pass@tcp(source:3306)/sourcedb\" \\\n")
+		fmt.Fprintf(os.Stderr, "      --target-dsn \"user:pass@tcp(target:3306)/targetdb\" \\\n")
+		fmt.Fprintf(os.Stderr, "      --sync-mode incremental --timestamp-column updated_at\n\n")
+
+		fmt.Fprintf(os.Stderr, "更多信息请访问: https://github.com/mageia/db-sync\n")
+	}
 
 	pflag.Parse()
 
@@ -231,7 +275,7 @@ func main() {
 		// 对于备份/恢复操作，从DSN检测类型
 		detectedType = detectDBType(dsn)
 	}
-	
+
 	if detectedType == "" && dbType == "" {
 		fmt.Println("错误: 无法从DSN自动识别数据库类型，请使用 --type 参数指定数据库类型 (postgres/mysql)")
 		os.Exit(1)
@@ -452,14 +496,14 @@ func main() {
 				}
 				lastTable = tableName
 			}
-			
+
 			if total > 0 {
 				percent := float64(processed) / float64(total) * 100
 				fmt.Printf("\r同步表 %s: %d/%d (%.1f%%)   ", tableName, processed, total, percent)
 			} else {
 				fmt.Printf("\r同步表 %s: %d 条记录   ", tableName, processed)
 			}
-			
+
 			// 如果处理完成，换行
 			if processed == total && total > 0 {
 				fmt.Println()
@@ -499,11 +543,11 @@ func main() {
 				if mode == backup.SyncModeFull {
 					fmt.Printf("全量同步 %d 条记录", result.InsertedRows)
 				} else {
-					fmt.Printf("增量同步 %d 条 (新增: %d, 更新: %d, 跳过: %d)", 
+					fmt.Printf("增量同步 %d 条 (新增: %d, 更新: %d, 跳过: %d)",
 						result.ProcessedRows, result.InsertedRows, result.UpdatedRows, result.SkippedRows)
 				}
 				fmt.Printf(" 耗时: %v\n", result.Duration)
-				
+
 				if result.LastSyncTime != nil {
 					fmt.Printf("   最新时间戳: %s\n", result.LastSyncTime.Format(time.RFC3339))
 				}
