@@ -729,9 +729,21 @@ func (m *MySQLBackup) syncTableFull(ctx context.Context, sourceDB, targetDB *sql
 			opts.Logger.Info("已创建目标表", "table", table)
 		} else {
 			// 清空目标表（全量同步）
+			// 临时禁用外键检查
+			if _, err := targetDB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=0"); err != nil {
+				return fmt.Errorf("禁用外键检查失败: %w", err)
+			}
+			
 			truncateQuery := fmt.Sprintf("TRUNCATE TABLE `%s`", table)
 			if _, err := targetDB.ExecContext(ctx, truncateQuery); err != nil {
+				// 恢复外键检查
+				targetDB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=1")
 				return fmt.Errorf("清空目标表失败: %w", err)
+			}
+			
+			// 恢复外键检查
+			if _, err := targetDB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=1"); err != nil {
+				return fmt.Errorf("恢复外键检查失败: %w", err)
 			}
 		}
 	}
