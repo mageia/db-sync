@@ -533,7 +533,187 @@ func (m *MySQLBackup) extractTableNameFromInsert(insertSQL string) string {
 	return ""
 }
 
-// SyncDatabase 数据库间同步
+// tableRetryInfo 记录表的重试信息
+type tableRetryInfo struct {
+	tableName    string
+	retryCount   int
+	lastError    error
+	dependencies []string // 依赖的表
+}
+
+// syncWithRetryQueue 使用重试队列处理表同步（处理外键约束）
+func (m *MySQLBackup) syncWithRetryQueue(ctx context.Context, sourceDB, targetDB *sql.DB, tables []string, opts backup.SyncOptions) ([]backup.SyncResult, error) {
+	const maxRetries = 3 // 最大重试次数
+	
+	var results []backup.SyncResult
+	retryQueue := make([]*tableRetryInfo, 0)
+	completedTables := make(map[string]bool)
+	
+	// 初始化重试队列
+	for _, table := range tables {
+		retryQueue = append(retryQueue, &tableRetryInfo{
+			tableName:  table,
+			retryCount: 0,
+		})
+	}
+	
+	// 处理队列直到为空或所有表都达到最大重试次数
+	for len(retryQueue) > 0 {
+		currentQueue := retryQueue
+		retryQueue = make([]*tableRetryInfo, 0)
+		hasProgress := false // 标记本轮是否有进展
+		
+		for _, tableInfo := range currentQueue {
+			// 检查是否已完成
+			if completedTables[tableInfo.tableName] {
+				continue
+			}
+			
+			opts.Logger.Info("同步表", "table", tableInfo.tableName, "retry", tableInfo.retryCount, "mode", opts.Mode)
+			
+			// 尝试同步表
+			result, err := m.syncTable(ctx, sourceDB, targetDB, tableInfo.tableName, opts)
+			
+			if err != nil {
+				// 检查是否是外键约束错误
+				if m.isForeignKeyError(err) && tableInfo.retryCount < maxRetries {
+					tableInfo.retryCount++
+					tableInfo.lastError = err
+					
+					// 尝试解析依赖关系
+					deps := m.extractDependencies(err)
+					if len(deps) > 0 {
+						tableInfo.dependencies = deps
+					}
+					
+					// 重新加入队列
+					retryQueue = append(retryQueue, tableInfo)
+					opts.Logger.Info("表同步因外键约束失败，加入重试队列", 
+						"table", tableInfo.tableName, 
+						"retry_count", tableInfo.retryCount,
+						"max_retries", maxRetries,
+						"dependencies", strings.Join(tableInfo.dependencies, ","))
+				} else {
+					// 达到最大重试次数或非外键错误
+					result.ErrorMessage = err.Error()
+					if tableInfo.retryCount >= maxRetries {
+						opts.Logger.Error("表同步达到最大重试次数", 
+							"table", tableInfo.tableName, 
+							"retries", tableInfo.retryCount, 
+							"error", err)
+						result.ErrorMessage = fmt.Sprintf("达到最大重试次数(%d): %v", maxRetries, err)
+					} else {
+						opts.Logger.Error("表同步失败", "table", tableInfo.tableName, "error", err)
+					}
+					results = append(results, result)
+					
+					// 如果策略为 fail，立即停止
+					if opts.ConflictStrategy == backup.ConflictStrategyFail {
+						// 将剩余的表标记为跳过
+						for _, remaining := range retryQueue {
+							skipResult := backup.SyncResult{
+								TableName:    remaining.tableName,
+								ErrorMessage: "因前置表失败而跳过",
+							}
+							results = append(results, skipResult)
+						}
+						return results, fmt.Errorf("同步表 %s 失败: %w", tableInfo.tableName, err)
+					}
+				}
+			} else {
+				// 同步成功
+				completedTables[tableInfo.tableName] = true
+				results = append(results, result)
+				hasProgress = true
+				opts.Logger.Info("表同步成功", "table", tableInfo.tableName, "rows", result.ProcessedRows)
+			}
+		}
+		
+		// 如果本轮没有任何进展，检查是否有循环依赖
+		if !hasProgress && len(retryQueue) > 0 {
+			// 尝试禁用外键检查同步剩余的表
+			opts.Logger.Info("检测到可能的循环依赖，尝试禁用外键检查同步剩余表", "count", len(retryQueue))
+			
+			// 临时禁用外键检查
+			if _, err := targetDB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=0"); err != nil {
+				opts.Logger.Error("禁用外键检查失败", "error", err)
+			} else {
+				defer func() {
+					// 恢复外键检查
+					if _, err := targetDB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS=1"); err != nil {
+						opts.Logger.Error("恢复外键检查失败", "error", err)
+					}
+				}()
+				
+				// 重试剩余的表
+				for _, tableInfo := range retryQueue {
+					result, err := m.syncTable(ctx, sourceDB, targetDB, tableInfo.tableName, opts)
+					if err != nil {
+						result.ErrorMessage = fmt.Sprintf("禁用外键后仍失败: %v", err)
+						opts.Logger.Error("禁用外键检查后同步仍失败", "table", tableInfo.tableName, "error", err)
+					} else {
+						completedTables[tableInfo.tableName] = true
+						opts.Logger.Info("禁用外键检查后同步成功", "table", tableInfo.tableName)
+					}
+					results = append(results, result)
+				}
+				
+				// 清空重试队列
+				retryQueue = nil
+			}
+		}
+	}
+	
+	return results, nil
+}
+
+// isForeignKeyError 检查错误是否是外键约束错误
+func (m *MySQLBackup) isForeignKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "foreign key") || 
+		   strings.Contains(errStr, "constraint") ||
+		   strings.Contains(errStr, "cannot delete or update a parent row") ||
+		   strings.Contains(errStr, "cannot add or update a child row") ||
+		   strings.Contains(errStr, "1451") || // MySQL错误码：Cannot delete or update a parent row
+		   strings.Contains(errStr, "1452") || // MySQL错误码：Cannot add or update a child row
+		   strings.Contains(errStr, "1217")    // MySQL错误码：Cannot delete or update a parent row (外键约束)
+}
+
+// extractDependencies 从错误信息中提取依赖的表名
+func (m *MySQLBackup) extractDependencies(err error) []string {
+	if err == nil {
+		return nil
+	}
+	
+	var dependencies []string
+	errStr := err.Error()
+	
+	// 尝试从错误信息中提取表名
+	// MySQL 外键错误通常包含 CONSTRAINT `fk_name` FOREIGN KEY ... REFERENCES `table_name`
+	re := regexp.MustCompile(`REFERENCES\s+` + "`" + `([^` + "`" + `]+)` + "`")
+	matches := re.FindAllStringSubmatch(errStr, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			dependencies = append(dependencies, match[1])
+		}
+	}
+	
+	// 也尝试查找 CONSTRAINT 名称中的表名
+	re2 := regexp.MustCompile(`CONSTRAINT\s+` + "`" + `[^` + "`" + `]*_([^_` + "`" + `]+)` + "`")
+	matches2 := re2.FindAllStringSubmatch(errStr, -1)
+	for _, match := range matches2 {
+		if len(match) > 1 {
+			dependencies = append(dependencies, match[1])
+		}
+	}
+	
+	return dependencies
+}
+
+// SyncDatabase 数据库间同步（支持外键约束重试）
 func (m *MySQLBackup) SyncDatabase(ctx context.Context, sourceDSN, targetDSN string, opts backup.SyncOptions) ([]backup.SyncResult, error) {
 	// 连接源数据库
 	sourceDB, err := m.openDBWithRetry(ctx, sourceDSN)
@@ -558,27 +738,8 @@ func (m *MySQLBackup) SyncDatabase(ctx context.Context, sourceDSN, targetDSN str
 		}
 	}
 
-	var results []backup.SyncResult
-
-	// 逐表同步
-	for _, table := range tables {
-		opts.Logger.Info("开始同步表", "table", table, "mode", opts.Mode)
-		
-		result, err := m.syncTable(ctx, sourceDB, targetDB, table, opts)
-		if err != nil {
-			opts.Logger.Error("同步表失败", "table", table, "error", err)
-			result.ErrorMessage = err.Error()
-		}
-		
-		results = append(results, result)
-		
-		// 如果遇到错误且策略为 fail，立即停止
-		if err != nil && opts.ConflictStrategy == backup.ConflictStrategyFail {
-			return results, fmt.Errorf("同步表 %s 失败: %w", table, err)
-		}
-	}
-
-	return results, nil
+	// 使用重试队列机制处理外键约束
+	return m.syncWithRetryQueue(ctx, sourceDB, targetDB, tables, opts)
 }
 
 // syncTable 同步单个表
@@ -1040,4 +1201,307 @@ func (m *MySQLBackup) batchUpsert(ctx context.Context, db *sql.DB, table string,
 	}
 
 	return rowsAffected, 0, nil
+}
+
+// ValidateData 验证两个MySQL数据库之间的数据一致性
+func (m *MySQLBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN string, opts backup.DataValidationOptions) ([]backup.DataValidationResult, error) {
+	// 连接源数据库
+	sourceDB, err := m.openDBWithRetry(ctx, sourceDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接源数据库失败: %w", err)
+	}
+	defer sourceDB.Close()
+
+	// 连接目标数据库
+	targetDB, err := m.openDBWithRetry(ctx, targetDSN)
+	if err != nil {
+		return nil, fmt.Errorf("连接目标数据库失败: %w", err)
+	}
+	defer targetDB.Close()
+
+	// 获取要校验的表列表
+	tables := opts.Tables
+	if len(tables) == 0 {
+		tables, err = m.getAllTablesFromDB(ctx, sourceDB)
+		if err != nil {
+			return nil, fmt.Errorf("获取源数据库表列表失败: %w", err)
+		}
+	}
+
+	var results []backup.DataValidationResult
+	
+	// 逐表校验
+	for _, table := range tables {
+		opts.Logger.Info("开始校验表", "table", table)
+		
+		result := backup.DataValidationResult{
+			TableName: table,
+			IsValid:   false,
+		}
+
+		// 获取表结构信息
+		columns, primaryKeys, err := m.getTableInfo(ctx, sourceDB, table)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("获取源表信息失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		// 检查目标表是否存在
+		exists, err := m.tableExists(ctx, targetDB, table)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("检查目标表失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+		if !exists {
+			result.ErrorMessage = "目标表不存在"
+			results = append(results, result)
+			continue
+		}
+
+		// 获取行数
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)
+		if err := sourceDB.QueryRowContext(ctx, countQuery).Scan(&result.SourceRows); err != nil {
+			result.ErrorMessage = fmt.Sprintf("获取源表行数失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+		if err := targetDB.QueryRowContext(ctx, countQuery).Scan(&result.TargetRows); err != nil {
+			result.ErrorMessage = fmt.Sprintf("获取目标表行数失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		// 如果行数不一致，直接标记为不一致
+		if result.SourceRows != result.TargetRows {
+			result.IsValid = false
+			result.ErrorMessage = fmt.Sprintf("行数不一致: 源表=%d, 目标表=%d", result.SourceRows, result.TargetRows)
+			results = append(results, result)
+			continue
+		}
+
+		// 如果不需要比较实际数据，只要行数一致就认为校验通过
+		if !opts.CompareData {
+			result.IsValid = true
+			results = append(results, result)
+			continue
+		}
+
+		// 计算校验和
+		if len(opts.ChecksumColumns) == 0 {
+			opts.ChecksumColumns = columns
+		}
+		
+		sourceChecksum, err := m.calculateTableChecksum(ctx, sourceDB, table, opts.ChecksumColumns, primaryKeys)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("计算源表校验和失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+		result.SourceChecksum = sourceChecksum
+
+		targetChecksum, err := m.calculateTableChecksum(ctx, targetDB, table, opts.ChecksumColumns, primaryKeys)
+		if err != nil {
+			result.ErrorMessage = fmt.Sprintf("计算目标表校验和失败: %v", err)
+			results = append(results, result)
+			continue
+		}
+		result.TargetChecksum = targetChecksum
+
+		// 比较校验和
+		if sourceChecksum == targetChecksum {
+			result.IsValid = true
+		} else {
+			result.IsValid = false
+			result.ErrorMessage = "数据校验和不匹配"
+			
+			// 如果需要，进行抽样比较找出不匹配的数据
+			if opts.SampleSize > 0 {
+				mismatches, err := m.findDataMismatches(ctx, sourceDB, targetDB, table, columns, primaryKeys, int64(opts.SampleSize))
+				if err != nil {
+					opts.Logger.Error("查找不匹配数据失败", "table", table, "error", err)
+				} else {
+					result.Details = mismatches
+					result.MismatchedRows = int64(len(mismatches))
+					result.SampleSize = int64(opts.SampleSize)
+					if result.SampleSize > result.SourceRows {
+						result.SampleSize = result.SourceRows
+					}
+					result.MatchedRows = result.SampleSize - result.MismatchedRows
+				}
+			}
+		}
+
+		results = append(results, result)
+		
+		// 更新进度
+		if opts.ProgressCallback != nil {
+			opts.ProgressCallback(table, int64(len(results)), int64(len(tables)))
+		}
+	}
+
+	return results, nil
+}
+
+// calculateTableChecksum 计算表的校验和
+func (m *MySQLBackup) calculateTableChecksum(ctx context.Context, db *sql.DB, table string, columns, primaryKeys []string) (string, error) {
+	// 构建校验和查询
+	// 使用 MD5 和 CONCAT 计算整个表的校验和
+	columnList := make([]string, len(columns))
+	for i, col := range columns {
+		// 使用 COALESCE 处理 NULL 值
+		columnList[i] = fmt.Sprintf("COALESCE(`%s`, 'NULL')", col)
+	}
+	
+	// 构建排序子句
+	orderBy := ""
+	if len(primaryKeys) > 0 {
+		orderBy = fmt.Sprintf(" ORDER BY %s", strings.Join(primaryKeys, ", "))
+	}
+	
+	// 使用 GROUP_CONCAT 和 MD5 计算整个表的校验和
+	query := fmt.Sprintf(`
+		SELECT MD5(GROUP_CONCAT(
+			MD5(CONCAT(%s))
+			SEPARATOR ''
+		)) AS checksum
+		FROM (
+			SELECT * FROM %s%s
+		) AS t
+	`, strings.Join(columnList, ", ','', "), "`"+table+"`", orderBy)
+	
+	var checksum sql.NullString
+	if err := db.QueryRowContext(ctx, query).Scan(&checksum); err != nil {
+		return "", err
+	}
+	
+	if !checksum.Valid {
+		return "", nil
+	}
+	
+	return checksum.String, nil
+}
+
+// findDataMismatches 查找数据不匹配的记录
+func (m *MySQLBackup) findDataMismatches(ctx context.Context, sourceDB, targetDB *sql.DB, table string, columns, primaryKeys []string, sampleSize int64) ([]backup.DataMismatchDetail, error) {
+	if len(primaryKeys) == 0 {
+		// 没有主键，无法精确比较
+		return nil, fmt.Errorf("表 %s 没有主键，无法进行数据比较", table)
+	}
+
+	var mismatches []backup.DataMismatchDetail
+	
+	// 构建查询，使用 LIMIT 进行抽样
+	orderBy := strings.Join(primaryKeys, ", ")
+	query := fmt.Sprintf("SELECT * FROM `%s` ORDER BY %s LIMIT ?", table, orderBy)
+	
+	// 查询源数据
+	sourceRows, err := sourceDB.QueryContext(ctx, query, sampleSize)
+	if err != nil {
+		return nil, fmt.Errorf("查询源数据失败: %w", err)
+	}
+	defer sourceRows.Close()
+	
+	// 处理每一行
+	for sourceRows.Next() {
+		// 扫描源数据
+		sourceValues := make([]interface{}, len(columns))
+		sourceValuePtrs := make([]interface{}, len(columns))
+		for i := range columns {
+			sourceValuePtrs[i] = &sourceValues[i]
+		}
+		
+		if err := sourceRows.Scan(sourceValuePtrs...); err != nil {
+			return nil, fmt.Errorf("扫描源数据失败: %w", err)
+		}
+		
+		// 构建主键条件
+		primaryKeyValues := make(map[string]interface{})
+		whereConditions := make([]string, 0)
+		whereArgs := make([]interface{}, 0)
+		
+		for i, col := range columns {
+			// 检查是否是主键
+			isPK := false
+			for _, pk := range primaryKeys {
+				if strings.Trim(pk, "`") == col {
+					isPK = true
+					break
+				}
+			}
+			if isPK {
+				primaryKeyValues[col] = sourceValues[i]
+				whereConditions = append(whereConditions, fmt.Sprintf("`%s` = ?", col))
+				whereArgs = append(whereArgs, sourceValues[i])
+			}
+		}
+		
+		// 查询目标数据库中对应的记录
+		targetQuery := fmt.Sprintf("SELECT * FROM `%s` WHERE %s", table, strings.Join(whereConditions, " AND "))
+		targetRow := targetDB.QueryRowContext(ctx, targetQuery, whereArgs...)
+		
+		targetValues := make([]interface{}, len(columns))
+		targetValuePtrs := make([]interface{}, len(columns))
+		for i := range columns {
+			targetValuePtrs[i] = &targetValues[i]
+		}
+		
+		if err := targetRow.Scan(targetValuePtrs...); err != nil {
+			if err == sql.ErrNoRows {
+				// 目标表中没有对应记录
+				mismatches = append(mismatches, backup.DataMismatchDetail{
+					PrimaryKey:  primaryKeyValues,
+					ColumnName:  "(记录不存在)",
+					SourceValue: "(存在)",
+					TargetValue: "(不存在)",
+				})
+			}
+			continue
+		}
+		
+		// 比较每个列的值
+		for i, col := range columns {
+			if !m.compareValues(sourceValues[i], targetValues[i]) {
+				mismatches = append(mismatches, backup.DataMismatchDetail{
+					PrimaryKey:  primaryKeyValues,
+					ColumnName:  col,
+					SourceValue: sourceValues[i],
+					TargetValue: targetValues[i],
+				})
+			}
+		}
+	}
+	
+	return mismatches, nil
+}
+
+// compareValues 比较两个值是否相等
+func (m *MySQLBackup) compareValues(a, b interface{}) bool {
+	// 处理 NULL 值
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	
+	// 将 []byte 转换为 string 进行比较
+	aBytes, aIsByte := a.([]byte)
+	bBytes, bIsByte := b.([]byte)
+	
+	if aIsByte && bIsByte {
+		return string(aBytes) == string(bBytes)
+	}
+	
+	if aIsByte {
+		return string(aBytes) == fmt.Sprintf("%v", b)
+	}
+	
+	if bIsByte {
+		return fmt.Sprintf("%v", a) == string(bBytes)
+	}
+	
+	// 使用反射进行深度比较
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }

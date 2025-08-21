@@ -60,6 +60,7 @@ type SyncOptions struct {
 	TimestampColumn  string                  // 增量同步时间戳列名（增量模式必需）
 	LastSyncTime     *time.Time              // 上次同步时间（增量模式使用）
 	DryRun           bool                    // 是否为试运行
+	AutoFixSchema    bool                    // 是否自动修复表结构差异
 	Logger           Logger                  // 日志接口
 	ProgressCallback ProgressCallback        // 进度回调函数
 }
@@ -77,6 +78,39 @@ type SyncResult struct {
 	ErrorMessage    string
 }
 
+// DataValidationOptions 数据校验选项
+type DataValidationOptions struct {
+	Tables           []string         // 要校验的表，为空则校验所有表
+	SampleSize       int              // 抽样校验的记录数（0表示全量校验）
+	ChecksumColumns  []string         // 用于计算校验和的列（为空则使用所有列）
+	CompareData      bool             // 是否比较实际数据（不仅仅是行数）
+	Logger           Logger           // 日志接口
+	ProgressCallback ProgressCallback // 进度回调函数
+}
+
+// DataValidationResult 数据校验结果
+type DataValidationResult struct {
+	TableName       string
+	SourceRows      int64
+	TargetRows      int64
+	SampleSize      int64  // 实际抽样数量
+	MatchedRows     int64  // 匹配的行数
+	MismatchedRows  int64  // 不匹配的行数
+	SourceChecksum  string // 源表校验和
+	TargetChecksum  string // 目标表校验和
+	IsValid         bool
+	ErrorMessage    string
+	Details         []DataMismatchDetail // 数据不匹配的详细信息
+}
+
+// DataMismatchDetail 数据不匹配的详细信息
+type DataMismatchDetail struct {
+	PrimaryKey   map[string]interface{} // 主键值
+	ColumnName   string                 // 不匹配的列名
+	SourceValue  interface{}            // 源值
+	TargetValue  interface{}            // 目标值
+}
+
 // DatabaseBackup 定义数据库备份恢复接口
 type DatabaseBackup interface {
 	// Sync 备份数据库到文件
@@ -90,6 +124,9 @@ type DatabaseBackup interface {
 
 	// SyncDatabase 数据库间同步
 	SyncDatabase(ctx context.Context, sourceDSN, targetDSN string, opts SyncOptions) ([]SyncResult, error)
+
+	// ValidateData 验证两个数据库之间的数据一致性
+	ValidateData(ctx context.Context, sourceDSN, targetDSN string, opts DataValidationOptions) ([]DataValidationResult, error)
 }
 
 // Logger 定义日志接口

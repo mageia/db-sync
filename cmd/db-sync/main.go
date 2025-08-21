@@ -160,10 +160,16 @@ func main() {
 		timestampColumn  string
 		lastSyncTime     string
 		dryRun           bool
+		// 数据校验相关参数
+		validateData    bool
+		sampleSize      int
+		compareDetail   bool
+		// 表结构同步参数
+		autoFixSchema   bool
 	)
 
 	// 定义参数，自动支持长短形式
-	pflag.StringVarP(&operation, "op", "o", "", "操作类型: sync/load/sync-db")
+	pflag.StringVarP(&operation, "op", "o", "", "操作类型: sync/load/sync-db/validate-data")
 	pflag.StringVarP(&dbType, "type", "t", "", "数据库类型: postgres/mysql (可选，通常可以从DSN自动识别)")
 	pflag.StringVarP(&dsn, "dsn", "d", "", "数据库连接字符串")
 	pflag.StringVarP(&file, "file", "f", "", "备份文件路径")
@@ -181,43 +187,41 @@ func main() {
 	pflag.StringVar(&lastSyncTime, "last-sync-time", "", "上次同步时间 (RFC3339格式)")
 	pflag.BoolVar(&dryRun, "dry-run", false, "试运行模式，不实际修改数据")
 
+	// 数据校验相关参数
+	pflag.BoolVar(&validateData, "validate-data", false, "同步后是否验证数据一致性")
+	pflag.IntVar(&sampleSize, "sample-size", 100, "数据校验抽样大小（0表示全量校验）")
+	pflag.BoolVar(&compareDetail, "compare-detail", false, "是否比较数据详情（不仅仅是行数）")
+
+	// 表结构同步参数
+	pflag.BoolVar(&autoFixSchema, "auto-fix-schema", true, "自动修复目标表结构差异")
+
 	// 自定义 help 函数
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "db-sync - 数据库备份、恢复与同步工具\n\n")
 		fmt.Fprintf(os.Stderr, "使用方法:\n")
-		fmt.Fprintf(os.Stderr, "  %s [选项]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s [选项]\n\n", "db-sync")
 
 		fmt.Fprintf(os.Stderr, "选项:\n")
 		pflag.PrintDefaults()
 
 		fmt.Fprintf(os.Stderr, "\nDSN 格式示例:\n")
-		fmt.Fprintf(os.Stderr, "  PostgreSQL:\n")
-		fmt.Fprintf(os.Stderr, "    - URL格式:        postgresql://username:password@localhost:5432/dbname?sslmode=disable\n")
-		fmt.Fprintf(os.Stderr, "    - 连接字符串格式: host=localhost port=5432 user=username password=password dbname=mydb sslmode=disable\n")
-		fmt.Fprintf(os.Stderr, "    - 简化格式:       postgres://user:pass@localhost/mydb\n\n")
+		fmt.Fprintf(os.Stderr, "  PostgreSQL: postgresql://username:password@localhost:5432/dbname?sslmode=disable\n")
+		fmt.Fprintf(os.Stderr, "  MySQL: username:password@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True\n")
 
-		fmt.Fprintf(os.Stderr, "  MySQL:\n")
-		fmt.Fprintf(os.Stderr, "    - 标准格式:       username:password@tcp(localhost:3306)/dbname?charset=utf8mb4&parseTime=True\n")
-		fmt.Fprintf(os.Stderr, "    - Unix套接字:     username:password@unix(/var/run/mysqld/mysqld.sock)/dbname\n")
-		fmt.Fprintf(os.Stderr, "    - 简化格式:       user:pass@tcp(localhost)/mydb\n\n")
-
-		fmt.Fprintf(os.Stderr, "使用示例:\n")
+		fmt.Fprintf(os.Stderr, "\n使用示例:\n")
 		fmt.Fprintf(os.Stderr, "  备份 PostgreSQL 数据库:\n")
-		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"postgresql://user:pass@localhost:5432/mydb\"\n\n", os.Args[0])
-
+		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"postgresql://user:pass@localhost:5432/mydb\"\n\n", "db-sync")
 		fmt.Fprintf(os.Stderr, "  恢复 PostgreSQL 数据库:\n")
-		fmt.Fprintf(os.Stderr, "    %s --op load --dsn \"postgresql://user:pass@localhost:5432/mydb\" --file backup.sql\n\n", os.Args[0])
-
+		fmt.Fprintf(os.Stderr, "    %s --op load --dsn \"postgresql://user:pass@localhost:5432/mydb\" --file backup.sql\n\n", "db-sync")
 		fmt.Fprintf(os.Stderr, "  同步 PostgreSQL 数据库:\n")
-		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", "db-sync")
 		fmt.Fprintf(os.Stderr, "      --source-dsn \"postgresql://user:pass@source:5432/sourcedb\" \\\n")
 		fmt.Fprintf(os.Stderr, "      --target-dsn \"postgresql://user:pass@target:5432/targetdb\"\n\n")
 
 		fmt.Fprintf(os.Stderr, "  备份 MySQL 数据库特定表:\n")
-		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"user:pass@tcp(localhost:3306)/mydb\" --tables \"users,orders\"\n\n", os.Args[0])
-
+		fmt.Fprintf(os.Stderr, "    %s --op sync --dsn \"user:pass@tcp(localhost:3306)/mydb\" --tables \"users,orders\"\n\n", "db-sync")
 		fmt.Fprintf(os.Stderr, "  增量同步 MySQL 数据库:\n")
-		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "    %s --op sync-db \\\n", "db-sync")
 		fmt.Fprintf(os.Stderr, "      --source-dsn \"user:pass@tcp(source:3306)/sourcedb\" \\\n")
 		fmt.Fprintf(os.Stderr, "      --target-dsn \"user:pass@tcp(target:3306)/targetdb\" \\\n")
 		fmt.Fprintf(os.Stderr, "      --sync-mode incremental --timestamp-column updated_at\n\n")
@@ -231,14 +235,14 @@ func main() {
 	var missingFlags []string
 	if operation == "" {
 		missingFlags = append(missingFlags, "--op")
-	} else if operation != "sync" && operation != "load" && operation != "sync-db" {
-		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync/load/sync-db\n", operation)
+	} else if operation != "sync" && operation != "load" && operation != "sync-db" && operation != "validate-data" {
+		fmt.Printf("错误: 不支持的操作类型 '%s'，必须是 sync/load/sync-db/validate-data\n", operation)
 		os.Exit(1)
 	}
 
 	// 根据操作类型检查不同的必需参数
-	if operation == "sync-db" {
-		// 同步模式需要 source-dsn 和 target-dsn
+	if operation == "sync-db" || operation == "validate-data" {
+		// 同步和校验模式需要 source-dsn 和 target-dsn
 		if sourceDSN == "" {
 			missingFlags = append(missingFlags, "--source-dsn")
 		}
@@ -519,6 +523,7 @@ func main() {
 			TimestampColumn:  timestampColumn,
 			LastSyncTime:     lastSync,
 			DryRun:           dryRun,
+			AutoFixSchema:    autoFixSchema,
 			Logger:           logger,
 			ProgressCallback: progressCallback,
 		})
@@ -574,6 +579,201 @@ func main() {
 		if !allSuccess {
 			fmt.Println("同步过程中存在错误，请检查上述输出")
 			os.Exit(1)
+		}
+
+		// 如果设置了 --validate-data，执行数据校验
+		if validateData {
+			fmt.Printf("\n=== 开始数据校验 ===\n")
+			
+			// 设置进度显示回调
+			var lastValidationTable string
+			validationProgressCallback := func(tableName string, processed, total int64) {
+				if tableName != lastValidationTable {
+					if lastValidationTable != "" {
+						fmt.Println() // 为之前的表换行
+					}
+					lastValidationTable = tableName
+				}
+				
+				if total > 0 {
+					percent := float64(processed) / float64(total) * 100
+					fmt.Printf("\r校验表: %d/%d (%.1f%%)   ", processed, total, percent)
+				} else {
+					fmt.Printf("\r校验表: %d   ", processed)
+				}
+			}
+			
+			// 执行数据校验
+			validationResults, err := dbInstance.ValidateData(ctx, sourceDSN, targetDSN, backup.DataValidationOptions{
+				Tables:           tableList,
+				SampleSize:       sampleSize,
+				CompareData:      compareDetail,
+				Logger:           logger,
+				ProgressCallback: validationProgressCallback,
+			})
+			fmt.Println() // 换行
+			
+			if err != nil {
+				fmt.Printf("数据校验失败: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// 显示校验结果
+			fmt.Printf("\n=== 数据校验结果 ===\n")
+			var validCount, invalidCount int
+			
+			for _, result := range validationResults {
+				if result.IsValid {
+					fmt.Printf("✅ 表 %s: 数据一致 (行数: %d)\n", result.TableName, result.SourceRows)
+					validCount++
+				} else {
+					fmt.Printf("❌ 表 %s: 数据不一致 - %s\n", result.TableName, result.ErrorMessage)
+					if len(result.Details) > 0 && len(result.Details) <= 10 {
+						fmt.Printf("   不匹配详情:\n")
+						for _, detail := range result.Details {
+							fmt.Printf("   - 主键: %v, 列: %s, 源值: %v, 目标值: %v\n",
+								detail.PrimaryKey, detail.ColumnName, detail.SourceValue, detail.TargetValue)
+						}
+					} else if len(result.Details) > 10 {
+						fmt.Printf("   显示前10条不匹配记录:\n")
+						for i := 0; i < 10; i++ {
+							detail := result.Details[i]
+							fmt.Printf("   - 主键: %v, 列: %s, 源值: %v, 目标值: %v\n",
+								detail.PrimaryKey, detail.ColumnName, detail.SourceValue, detail.TargetValue)
+						}
+						fmt.Printf("   ... 还有 %d 条不匹配记录\n", len(result.Details)-10)
+					}
+					invalidCount++
+				}
+			}
+			
+			fmt.Printf("\n总计: %d 个表通过校验, %d 个表未通过校验\n", validCount, invalidCount)
+			
+			if invalidCount > 0 {
+				fmt.Println("数据校验发现不一致，请检查上述输出")
+				os.Exit(1)
+			}
+		}
+
+	case "validate-data":
+		// 独立的数据校验操作
+		// 验证参数
+		if sourceDSN == "" {
+			fmt.Println("错误: 数据校验需要指定源数据库连接字符串 (--source-dsn)")
+			os.Exit(1)
+		}
+		if targetDSN == "" {
+			fmt.Println("错误: 数据校验需要指定目标数据库连接字符串 (--target-dsn)")
+			os.Exit(1)
+		}
+
+		// 从源 DSN 检测数据库类型
+		sourceFinalDBType := detectDBType(sourceDSN)
+		if sourceFinalDBType == "" && dbType == "" {
+			fmt.Println("错误: 无法从源DSN自动识别数据库类型，请使用 --type 参数指定数据库类型")
+			os.Exit(1)
+		}
+		if dbType != "" {
+			sourceFinalDBType = dbType
+		}
+
+		// 创建数据库实例
+		var dbInstance backup.DatabaseBackup
+		switch sourceFinalDBType {
+		case "postgres":
+			dbInstance = postgres.NewPostgresBackup(logger)
+		case "mysql":
+			dbInstance = mysql.NewMySQLBackup(logger)
+		default:
+			fmt.Printf("错误: 不支持的数据库类型: %s\n", sourceFinalDBType)
+			os.Exit(1)
+		}
+
+		// 设置进度显示回调
+		progressCallback := func(tableName string, processed, total int64) {
+			if total > 0 {
+				percent := float64(processed) / float64(total) * 100
+				fmt.Printf("\r校验进度: %d/%d 表 (%.1f%%)   ", processed, total, percent)
+			} else {
+				fmt.Printf("\r校验进度: %d 表   ", processed)
+			}
+		}
+
+		// 执行数据校验
+		fmt.Println("开始数据校验...")
+		results, err := dbInstance.ValidateData(ctx, sourceDSN, targetDSN, backup.DataValidationOptions{
+			Tables:           tableList,
+			SampleSize:       sampleSize,
+			CompareData:      compareDetail,
+			Logger:           logger,
+			ProgressCallback: progressCallback,
+		})
+		fmt.Println() // 换行
+
+		if err != nil {
+			fmt.Printf("数据校验失败: %v\n", err)
+			os.Exit(1)
+		}
+
+		// 显示校验结果
+		fmt.Printf("\n=== 数据校验结果 ===\n")
+		var validCount, invalidCount int
+		
+		for _, result := range results {
+			if result.IsValid {
+				fmt.Printf("✅ 表 %s: 数据一致\n", result.TableName)
+				fmt.Printf("   行数: %d\n", result.SourceRows)
+				if result.SourceChecksum != "" {
+					fmt.Printf("   校验和: %s\n", result.SourceChecksum)
+				}
+				validCount++
+			} else {
+				fmt.Printf("❌ 表 %s: 数据不一致\n", result.TableName)
+				fmt.Printf("   错误: %s\n", result.ErrorMessage)
+				if result.SourceRows > 0 || result.TargetRows > 0 {
+					fmt.Printf("   源表行数: %d, 目标表行数: %d\n", result.SourceRows, result.TargetRows)
+				}
+				if result.SourceChecksum != "" || result.TargetChecksum != "" {
+					fmt.Printf("   源校验和: %s\n", result.SourceChecksum)
+					fmt.Printf("   目标校验和: %s\n", result.TargetChecksum)
+				}
+				
+				// 显示不匹配的详细信息
+				if len(result.Details) > 0 {
+					fmt.Printf("   不匹配记录 (抽样 %d 条, 发现 %d 条不匹配):\n", 
+						result.SampleSize, result.MismatchedRows)
+					
+					displayCount := len(result.Details)
+					if displayCount > 5 {
+						displayCount = 5
+					}
+					
+					for i := 0; i < displayCount; i++ {
+						detail := result.Details[i]
+						fmt.Printf("     %d. 主键: %v\n", i+1, detail.PrimaryKey)
+						fmt.Printf("        列名: %s\n", detail.ColumnName)
+						fmt.Printf("        源值: %v\n", detail.SourceValue)
+						fmt.Printf("        目标值: %v\n", detail.TargetValue)
+					}
+					
+					if len(result.Details) > 5 {
+						fmt.Printf("     ... 还有 %d 条不匹配记录\n", len(result.Details)-5)
+					}
+				}
+				invalidCount++
+			}
+		}
+		
+		fmt.Printf("\n=== 总计 ===\n")
+		fmt.Printf("校验表数: %d\n", len(results))
+		fmt.Printf("通过: %d\n", validCount)
+		fmt.Printf("失败: %d\n", invalidCount)
+		
+		if invalidCount > 0 {
+			fmt.Println("\n数据校验发现不一致，请检查上述输出")
+			os.Exit(1)
+		} else {
+			fmt.Println("\n所有表数据校验通过")
 		}
 
 	default:
