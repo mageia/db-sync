@@ -1,8 +1,10 @@
 # 设置基本变量
 BINARY_NAME=db-sync
+MCP_BINARY_NAME=db-sync-mcp
 VERSION=0.1.3
 BUILD_DIR=build
 MAIN_PATH=cmd/db-sync/main.go
+MCP_MAIN_PATH=cmd/mcp-server/main.go
 
 # 获取当前 git commit hash（静默处理错误）
 COMMIT_HASH=$(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -19,6 +21,7 @@ PLATFORMS=linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64
 help:
 	@echo "Available targets:"
 	@echo "  build       - Build binary for current platform"
+	@echo "  build-mcp   - Build MCP server binary for current platform"
 	@echo "  build-all   - Build binaries for all platforms"
 	@echo "  clean       - Remove build directory"
 	@echo "  test        - Run tests"
@@ -44,6 +47,13 @@ build: init
 	@echo "Building $(BINARY_NAME) version $(VERSION)..."
 	@$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PATH)
 	@echo "Build complete: $(BUILD_DIR)/$(BINARY_NAME)"
+
+# 构建 MCP Server 二进制文件
+.PHONY: build-mcp
+build-mcp: init
+	@echo "Building $(MCP_BINARY_NAME) version $(VERSION)..."
+	@$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(MCP_BINARY_NAME) $(MCP_MAIN_PATH)
+	@echo "Build complete: $(BUILD_DIR)/$(MCP_BINARY_NAME)"
 
 # 构建所有平台的二进制文件
 .PHONY: build-all

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"db-sync/pkg/backup"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -160,7 +161,8 @@ func (p *PostgresBackup) backupTable(ctx context.Context, tx *sql.Tx, table stri
 				} else {
 					switch v := val.(type) {
 					case []byte:
-						vals[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(string(v), "'", "''"))
+						// 使用 PostgreSQL 的十六进制格式处理二进制数据 (bytea)
+						vals[i] = fmt.Sprintf("'\\x%s'", hex.EncodeToString(v))
 					case string:
 						vals[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(v, "'", "''"))
 					case time.Time:
@@ -997,15 +999,22 @@ func (p *PostgresBackup) batchInsertInTx(ctx context.Context, tx *sql.Tx, table 
 		quotedColumns[i] = pq.QuoteIdentifier(col)
 	}
 
-	// 构建值占位符
+	// 构建值占位符，对 []byte 类型使用 decode($n, 'hex') 格式
 	valuePlaceholders := make([]string, len(data))
 	args := make([]interface{}, 0, len(data)*len(columns))
 	
 	for i, row := range data {
 		placeholders := make([]string, len(columns))
 		for j := range columns {
-			placeholders[j] = fmt.Sprintf("$%d", i*len(columns)+j+1)
-			args = append(args, row[j])
+			paramIdx := len(args) + 1
+			// 检查是否是 []byte 类型，如果是则使用 decode 函数
+			if b, ok := row[j].([]byte); ok && row[j] != nil {
+				placeholders[j] = fmt.Sprintf("decode($%d, 'hex')", paramIdx)
+				args = append(args, hex.EncodeToString(b))
+			} else {
+				placeholders[j] = fmt.Sprintf("$%d", paramIdx)
+				args = append(args, row[j])
+			}
 		}
 		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
 	}
@@ -1212,12 +1221,13 @@ func (p *PostgresBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN 
 			continue
 		}
 
-		// 计算校验和
-		if len(opts.ChecksumColumns) == 0 {
-			opts.ChecksumColumns = columns
+		// 计算校验和 - 使用当前表的列，而不是 opts.ChecksumColumns（避免跨表复用）
+		checksumColumns := columns
+		if len(opts.ChecksumColumns) > 0 {
+			checksumColumns = opts.ChecksumColumns
 		}
 		
-		sourceChecksum, err := p.calculateTableChecksum(ctx, sourceDB, table, opts.ChecksumColumns, primaryKeys)
+		sourceChecksum, err := p.calculateTableChecksum(ctx, sourceDB, table, checksumColumns, primaryKeys)
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("计算源表校验和失败: %v", err)
 			results = append(results, result)
@@ -1225,7 +1235,7 @@ func (p *PostgresBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN 
 		}
 		result.SourceChecksum = sourceChecksum
 
-		targetChecksum, err := p.calculateTableChecksum(ctx, targetDB, table, opts.ChecksumColumns, primaryKeys)
+		targetChecksum, err := p.calculateTableChecksum(ctx, targetDB, table, checksumColumns, primaryKeys)
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("计算目标表校验和失败: %v", err)
 			results = append(results, result)
@@ -1278,7 +1288,11 @@ func (p *PostgresBackup) calculateTableChecksum(ctx context.Context, db *sql.DB,
 		columnList[i] = fmt.Sprintf("COALESCE(%s::text, 'NULL')", pq.QuoteIdentifier(col))
 	}
 	
-	// 构建排序子句（不再使用，直接在 ORDER BY 中使用列）
+	// 构建排序子句，primaryKeys 已经被 pq.QuoteIdentifier 包装过了
+	orderByClause := strings.Join(primaryKeys, ", ")
+	if len(primaryKeys) == 0 {
+		orderByClause = strings.Join(columnList, ", ")
+	}
 	
 	// PostgreSQL 使用 STRING_AGG 和 MD5 计算整个表的校验和
 	query := fmt.Sprintf(`
@@ -1289,7 +1303,7 @@ func (p *PostgresBackup) calculateTableChecksum(ctx context.Context, db *sql.DB,
 		)) AS checksum
 		FROM %s
 	`, strings.Join(columnList, " || ',' || "), 
-	   strings.Join(columnList, ", "), 
+	   orderByClause, 
 	   pq.QuoteIdentifier(table))
 	
 	var checksum sql.NullString
@@ -2057,15 +2071,22 @@ func (p *PostgresBackup) batchInsert(ctx context.Context, db *sql.DB, table stri
 		quotedColumns[i] = pq.QuoteIdentifier(col)
 	}
 
-	// 构建值占位符
+	// 构建值占位符，对 []byte 类型使用 decode($n, 'hex') 格式
 	valuePlaceholders := make([]string, len(data))
 	args := make([]interface{}, 0, len(data)*len(columns))
 	
 	for i, row := range data {
 		placeholders := make([]string, len(columns))
 		for j := range columns {
-			placeholders[j] = fmt.Sprintf("$%d", len(args)+1)
-			args = append(args, row[j])
+			paramIdx := len(args) + 1
+			// 检查是否是 []byte 类型，如果是则使用 decode 函数
+			if b, ok := row[j].([]byte); ok && row[j] != nil {
+				placeholders[j] = fmt.Sprintf("decode($%d, 'hex')", paramIdx)
+				args = append(args, hex.EncodeToString(b))
+			} else {
+				placeholders[j] = fmt.Sprintf("$%d", paramIdx)
+				args = append(args, row[j])
+			}
 		}
 		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
 	}
@@ -2196,15 +2217,22 @@ func (p *PostgresBackup) batchUpsert(ctx context.Context, db *sql.DB, table stri
 		quotedColumns[i] = pq.QuoteIdentifier(col)
 	}
 
-	// 构建值占位符
+	// 构建值占位符，对 []byte 类型使用 decode($n, 'hex') 格式
 	valuePlaceholders := make([]string, len(data))
 	args := make([]interface{}, 0, len(data)*len(columns))
 	
 	for i, row := range data {
 		placeholders := make([]string, len(columns))
 		for j := range columns {
-			placeholders[j] = fmt.Sprintf("$%d", len(args)+1)
-			args = append(args, row[j])
+			paramIdx := len(args) + 1
+			// 检查是否是 []byte 类型，如果是则使用 decode 函数
+			if b, ok := row[j].([]byte); ok && row[j] != nil {
+				placeholders[j] = fmt.Sprintf("decode($%d, 'hex')", paramIdx)
+				args = append(args, hex.EncodeToString(b))
+			} else {
+				placeholders[j] = fmt.Sprintf("$%d", paramIdx)
+				args = append(args, row[j])
+			}
 		}
 		valuePlaceholders[i] = fmt.Sprintf("(%s)", strings.Join(placeholders, ", "))
 	}
