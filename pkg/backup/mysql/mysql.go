@@ -1288,12 +1288,13 @@ func (m *MySQLBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN str
 			continue
 		}
 
-		// 计算校验和
-		if len(opts.ChecksumColumns) == 0 {
-			opts.ChecksumColumns = columns
+		// 计算校验和 - 使用当前表的列，而不是 opts.ChecksumColumns（避免跨表复用）
+		checksumColumns := columns
+		if len(opts.ChecksumColumns) > 0 {
+			checksumColumns = opts.ChecksumColumns
 		}
 		
-		sourceChecksum, err := m.calculateTableChecksum(ctx, sourceDB, table, opts.ChecksumColumns, primaryKeys)
+		sourceChecksum, err := m.calculateTableChecksum(ctx, sourceDB, table, checksumColumns, primaryKeys)
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("计算源表校验和失败: %v", err)
 			results = append(results, result)
@@ -1301,7 +1302,7 @@ func (m *MySQLBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN str
 		}
 		result.SourceChecksum = sourceChecksum
 
-		targetChecksum, err := m.calculateTableChecksum(ctx, targetDB, table, opts.ChecksumColumns, primaryKeys)
+		targetChecksum, err := m.calculateTableChecksum(ctx, targetDB, table, checksumColumns, primaryKeys)
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("计算目标表校验和失败: %v", err)
 			results = append(results, result)
@@ -1347,7 +1348,7 @@ func (m *MySQLBackup) ValidateData(ctx context.Context, sourceDSN, targetDSN str
 // calculateTableChecksum 计算表的校验和
 func (m *MySQLBackup) calculateTableChecksum(ctx context.Context, db *sql.DB, table string, columns, primaryKeys []string) (string, error) {
 	// 构建校验和查询
-	// 使用 MD5 和 CONCAT 计算整个表的校验和
+	// 使用 MD5 和 CONCAT_WS 计算整个表的校验和
 	columnList := make([]string, len(columns))
 	for i, col := range columns {
 		// 使用 COALESCE 处理 NULL 值
@@ -1361,15 +1362,16 @@ func (m *MySQLBackup) calculateTableChecksum(ctx context.Context, db *sql.DB, ta
 	}
 	
 	// 使用 GROUP_CONCAT 和 MD5 计算整个表的校验和
+	// 使用 CONCAT_WS 用逗号连接各列值
 	query := fmt.Sprintf(`
 		SELECT MD5(GROUP_CONCAT(
-			MD5(CONCAT(%s))
+			MD5(CONCAT_WS(',', %s))
 			SEPARATOR ''
 		)) AS checksum
 		FROM (
 			SELECT * FROM %s%s
 		) AS t
-	`, strings.Join(columnList, ", ','', "), "`"+table+"`", orderBy)
+	`, strings.Join(columnList, ", "), "`"+table+"`", orderBy)
 	
 	var checksum sql.NullString
 	if err := db.QueryRowContext(ctx, query).Scan(&checksum); err != nil {
