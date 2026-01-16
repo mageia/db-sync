@@ -282,6 +282,19 @@ func handleSync(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallTool
 		return mcp.NewToolResultError("缺少必需参数 target_dsn"), nil
 	}
 
+	// 检查源和目标数据库类型是否一致
+	sourceDBType := detectDBType(sourceDSN)
+	targetDBType := detectDBType(targetDSN)
+	if sourceDBType == "" {
+		return mcp.NewToolResultError(fmt.Sprintf("无法识别源数据库类型，DSN: %s", sanitizeDSN(sourceDSN))), nil
+	}
+	if targetDBType == "" {
+		return mcp.NewToolResultError(fmt.Sprintf("无法识别目标数据库类型，DSN: %s", sanitizeDSN(targetDSN))), nil
+	}
+	if sourceDBType != targetDBType {
+		return mcp.NewToolResultError(fmt.Sprintf("暂不支持跨数据库类型同步: 源=%s, 目标=%s。请确保源和目标数据库类型相同", sourceDBType, targetDBType)), nil
+	}
+
 	logger := &MCPLogger{}
 	db, err := getDBInstance(sourceDSN, logger)
 	if err != nil {
@@ -367,6 +380,19 @@ func handleValidate(ctx context.Context, request mcp.CallToolRequest) (*mcp.Call
 	targetDSN := mcp.ParseString(request, "target_dsn", "")
 	if targetDSN == "" {
 		return mcp.NewToolResultError("缺少必需参数 target_dsn"), nil
+	}
+
+	// 检查源和目标数据库类型是否一致
+	sourceDBType := detectDBType(sourceDSN)
+	targetDBType := detectDBType(targetDSN)
+	if sourceDBType == "" {
+		return mcp.NewToolResultError(fmt.Sprintf("无法识别源数据库类型，DSN: %s", sanitizeDSN(sourceDSN))), nil
+	}
+	if targetDBType == "" {
+		return mcp.NewToolResultError(fmt.Sprintf("无法识别目标数据库类型，DSN: %s", sanitizeDSN(targetDSN))), nil
+	}
+	if sourceDBType != targetDBType {
+		return mcp.NewToolResultError(fmt.Sprintf("暂不支持跨数据库类型校验: 源=%s, 目标=%s。请确保源和目标数据库类型相同", sourceDBType, targetDBType)), nil
 	}
 
 	logger := &MCPLogger{}
